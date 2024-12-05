@@ -1,8 +1,9 @@
 package main
 
 import (
+    "bufio"
     "bytes"
-    "hash/fnv"
+    "context"
     "crypto/sha256"
     "encoding/base64"
     "encoding/csv"
@@ -10,95 +11,99 @@ import (
     "errors"
     "flag"
     "fmt"
+    "hash/fnv"
     "io"
     "log"
+    "math/rand"
     "net"
     "os"
     "os/signal"
     "path/filepath"
+    "sort"
+    "strconv"
     "strings"
     "sync"
     "syscall"
     "time"
 )
 
-// 系统常量
+/*
+本代码为MP4参考实现的示例。
+
+主要功能点：
+1. RainStorm框架：
+   - Leader节点：负责任务分配（source/transform/aggregate），分区策略（hash分区），成员监控、故障恢复和调度。
+   - Worker节点：执行具体处理逻辑（source从HyDFS读数据行、transform过滤行和提取字段、aggregate根据key聚合计数）。
+   - 两级处理pipeline示例：source -> transform -> aggregate
+   - 最终结果输出到控制台与HyDFS中。
+
+2. Exactly-once语义：
+   - 每条tuple有唯一ID（source分配），各stage处理后写日志到HyDFS
+   - ACK机制：下游任务处理完成后向上游ACK，上游在超时未ACK重发
+   - Worker从HyDFS日志恢复状态和已处理的tuple ID，防止重复处理
+
+3. 故障检测与恢复：
+   - Leader定期对所有Worker发心跳，未响应标记为失败
+   - 失败后重新分配任务（包括恢复日志、状态）
+   - Workers在重启时从日志中恢复状态和已处理记录
+
+4. 演示测试要求：
+   - Test 1：无故障运行（过滤含X的行并输出OBJECTID,Sign_Type；对指定Sign Post类型X进行Category聚合）
+   - Test 2：在运行中kill两个非source的Worker，系统应恢复并保证exactly-once无重复输出
+   - Test 3：针对有状态aggregate操作注入故障，并恢复状态
+   - Test 4：展示HyDFS中某task的日志文件内容
+   - Test 5：代码流检查
+
+注意：
+- 需搭配实际的HyDFS实现（MP3）和故障检测(MP2)使用。本示例中提供了HydfsClient的简化调用逻辑，需要开发者根据实际情况实现。
+- 部分逻辑（如真正的任务调度、具体hash分区策略、实际的集群成员列表维护）在此示例中简化处理。实际需从配置文件或命令行参数传入集群拓扑信息。
+*/
+
+// -------------------- 常量与类型定义 --------------------
+
 const (
-    DefaultBatchSize    = 100
-    HeartbeatInterval   = 2 * time.Second
-    FailureTimeout      = 10 * time.Second
-    ProcessTimeout      = 5 * time.Second
-    StateCheckInterval  = 30 * time.Second
-    MaxRetries         = 3
-    BasePort          = 5000
-    FileServerPort    = 5001
-    HeartbeatPort     = 5002
-    LogBufferSize     = 1000
+    HeartbeatInterval = 2 * time.Second
+    FailureTimeout    = 5 * time.Second
+    ProcessTimeout    = 5 * time.Second
+    StateCheckInterval= 5 * time.Second
+    DefaultBatchSize  = 100
+
+    MsgTuple          = "TUPLE"
+    MsgBatch          = "BATCH"
+    MsgAck            = "ACK"
+    MsgError          = "ERROR"
+    MsgHeartbeat      = "HEARTBEAT"
+    MsgTaskAssign     = "TASK_ASSIGN"
+    MsgTaskReassign   = "TASK_REASSIGN"
+    MsgStateSync      = "STATE_SYNC"
+
+    RoleLeader        = "leader"
+    RoleWorker        = "worker"
+    StageSource       = "source"
+    StageTransform    = "transform"
+    StageAggregate    = "aggregate"
+
+    // 用于exactly-once去重的日志文件等
+    LogDirPrefix      = "logs"
+    StateDirPrefix    = "states"
+    OutputDirPrefix   = "outputs"
+
+    MaxRetries        = 3
 )
 
-type CommandLineOptions struct {
-    NodeID      string
-    Role        string
-    Addr        string
-    Port        int
-    SourceFile  string
-    DestFile    string
-    NumTasks    int
-    ParamX      string
-    HydfsAddr   string
-    HydfsPort   int
-    LogDir      string
-}
-
-// 错误定义
-var (
-    ErrFileNotFound     = errors.New("file not found")
-    ErrDuplicateTuple   = errors.New("duplicate tuple")
-    ErrNodeNotFound     = errors.New("node not found")
-    ErrInvalidOperation = errors.New("invalid operation")
-    ErrTimeout         = errors.New("operation timed out")
-)
-
-// NodeStatus 定义
 type NodeStatus int
-
 const (
     StatusNormal NodeStatus = iota
-    StatusSuspected
     StatusFailed
 )
 
-// MessageType 定义
-type MessageType string
-
-const (
-    MsgJoin        MessageType = "JOIN"
-    MsgHeartbeat   MessageType = "HEARTBEAT"
-    MsgStateSync   MessageType = "STATE_SYNC"
-    MsgTuple       MessageType = "TUPLE"
-    MsgBatch       MessageType = "BATCH"
-    MsgAck         MessageType = "ACK"
-    MsgError       MessageType = "ERROR"
-)
-
-// Message 结构体
 type Message struct {
-    Type      MessageType  `json:"type"`
-    SenderID  string       `json:"sender_id"`
-    Data      interface{}  `json:"data"`
-    Timestamp time.Time    `json:"timestamp"`
+    Type      string      `json:"type"`
+    SenderID  string      `json:"sender_id"`
+    Data      interface{} `json:"data"`
+    Timestamp time.Time   `json:"timestamp"`
 }
 
-// MemberInfo 结构体
-type MemberInfo struct {
-    ID            string     `json:"id"`
-    Address       string     `json:"address"`
-    Port          int        `json:"port"`
-    Status        NodeStatus `json:"status"`
-    LastHeartbeat time.Time  `json:"last_heartbeat"`
-}
-
-// Tuple 定义
 type Tuple struct {
     ID        string      `json:"id"`
     Key       string      `json:"key"`
@@ -106,760 +111,256 @@ type Tuple struct {
     Timestamp time.Time   `json:"timestamp"`
     BatchID   string      `json:"batch_id"`
     Source    string      `json:"source"`
-    Checksum  []byte      `json:"checksum"`
 }
 
-// Batch 定义
 type Batch struct {
-    ID            string          `json:"id"`
-    Tuples        []*Tuple        `json:"tuples"`
-    ProcessedIDs  map[string]bool `json:"processed_ids"`
-    NextStageAcks map[string]bool `json:"next_stage_acks"`
-    CreateTime    time.Time       `json:"create_time"`
-    Checksum      []byte          `json:"checksum"`
+    ID      string   `json:"id"`
+    Tuples  []*Tuple `json:"tuples"`
+    // 对于故障恢复需要保留ProcessedIDs和已发出但未ACK的tuple ID等信息
 }
 
-// State 定义
 type State struct {
     ProcessedTuples map[string]bool       `json:"processed_tuples"`
-    AggregateState  map[string]interface{} `json:"aggregate_state"`
+    AggregateState  map[string]int        `json:"aggregate_state"`
     LastSeqNum      int64                 `json:"last_seq_num"`
-    LastBatchID     string                `json:"last_batch_id"`
 }
 
-type LogEntry struct {
-    Timestamp time.Time         `json:"timestamp"`
-    Level     string           `json:"level"`
-    Type      string           `json:"type"`
-    Message   string           `json:"message"`
-    Data      json.RawMessage  `json:"data,omitempty"`  
-}
-
-// Worker 配置
 type WorkerConfig struct {
     ID          string
-    Role        string
+    Role        string // leader/worker
+    Stage       string // source/transform/aggregate (for workers)
     Addr        string
     Port        int
-    BatchSize   int
-    ParamX      string
+    ParamX      string // 用于过滤条件或指定Sign Post类型
     HydfsAddr   string
     HydfsPort   int
     LogDir      string
+    SrcFile     string
+    DestFile    string
+    NumTasks    int
+    ClusterFile string // 集群拓扑配置文件，用于leader和worker获取集群信息
 }
 
-// Worker 结构体
-type Worker struct {
-    Config         WorkerConfig
-    ID             string
-    Role           string
-    State          *State
-    CurrentBatch   *Batch
-    InputChan      chan *Tuple
-    OutputChan     chan *Tuple
-    LogChan        chan *LogEntry
-    StopChan       chan struct{}
-    
-    StateMutex     sync.RWMutex
-    BatchMutex     sync.RWMutex
-    
-    Listener       net.Listener
-    Connections    map[string]net.Conn
-    ConnMutex      sync.RWMutex
-    
-    HydfsClient    *HydfsClient
-    
-    Logger         *log.Logger
-    LogFile        *os.File
-
-    members        map[string]*MemberInfo
-    memberMutex    sync.RWMutex
+type MemberInfo struct {
+    ID            string
+    Address       string
+    Port          int
+    Status        NodeStatus
+    LastHeartbeat time.Time
+    Stage         string
 }
 
-// HydfsClient 定义
 type HydfsClient struct {
-    Addr     string
-    Port     int
-    conn     net.Conn
-    mutex    sync.Mutex
+    Addr  string
+    Port  int
+    mutex sync.Mutex
 }
 
-// 辅助函数
-func calculateChecksum(data []byte) []byte {
-    hash := sha256.New()
-    hash.Write(data)
-    return hash.Sum(nil)
-}
-
-// HydfsClient 方法实现
-func NewHydfsClient(addr string, port int) (*HydfsClient, error) {
-    return &HydfsClient{
-        Addr: addr,
-        Port: port,
-    }, nil
-}
-
-func (c *HydfsClient) connect() error {
-    c.mutex.Lock()
-    defer c.mutex.Unlock()
-
-    if c.conn != nil {
-        return nil
-    }
-
-    var err error
-    c.conn, err = net.DialTimeout("tcp", 
-        fmt.Sprintf("%s:%d", c.Addr, c.Port), 
-        ProcessTimeout)
-    if err != nil {
-        return err
-    }
-    return nil
-}
-
-func (c *HydfsClient) CreateFile(path string, data []byte) error {
-    if err := c.connect(); err != nil {
-        return err
-    }
-
-    req := struct {
-        Op   string `json:"op"`
-        Path string `json:"path"`
-        Data []byte `json:"data"`
-    }{
-        Op:   "CREATE",
-        Path: path,
-        Data: data,
-    }
-
-    return c.sendRequest(req)
-}
-
-func (c *HydfsClient) AppendFile(path string, data []byte) error {
+func (c *HydfsClient) connect() (net.Conn, error) {
     c.mutex.Lock()
     defer c.mutex.Unlock()
 
     addr := fmt.Sprintf("%s:%d", c.Addr, c.Port)
     conn, err := net.DialTimeout("tcp", addr, ProcessTimeout)
     if err != nil {
-        return fmt.Errorf("failed to connect to HyDFS: %v", err)
+        return nil, fmt.Errorf("failed to connect to HyDFS server at %s: %v", addr, err)
+    }
+    return conn, nil
+}
+
+func (c *HydfsClient) sendRequest(op string, path string, data []byte) (bool, []byte, string, error) {
+    req := map[string]interface{}{
+        "op":   op,
+        "path": path,
+    }
+
+    // 如果有数据需要传递（CREATE或APPEND）
+    if len(data) > 0 {
+        encodedData := base64.StdEncoding.EncodeToString(data)
+        req["data"] = encodedData
+    }
+
+    conn, err := c.connect()
+    if err != nil {
+        return false, nil, "", err
     }
     defer conn.Close()
 
-    request := struct {
-        Op   string `json:"op"`
-        Path string `json:"path"`
-        Data string `json:"data"`  // base64编码的数据
-    }{
-        Op:   "APPEND",
-        Path: path,
-        Data: base64.StdEncoding.EncodeToString(data),
+    // 发送请求
+    enc := json.NewEncoder(conn)
+    if err := enc.Encode(req); err != nil {
+        return false, nil, "", fmt.Errorf("failed to send request: %v", err)
     }
 
-    if err := json.NewEncoder(conn).Encode(request); err != nil {
-        return fmt.Errorf("failed to send request: %v", err)
-    }
-
-    var response struct {
+    // 接收响应
+    var resp struct {
         Success bool   `json:"success"`
+        Data    string `json:"data"`
         Error   string `json:"error,omitempty"`
     }
-    
-    if err := json.NewDecoder(conn).Decode(&response); err != nil {
-        return fmt.Errorf("failed to read response: %v", err)
+
+    dec := json.NewDecoder(conn)
+    if err := dec.Decode(&resp); err != nil {
+        return false, nil, "", fmt.Errorf("failed to decode response: %v", err)
     }
 
-    if !response.Success {
-        // return fmt.Errorf("HyDFS operation failed: %s", response.Error)
+    if !resp.Success {
+        return false, nil, resp.Error, nil
     }
 
+    // 对返回的Data进行base64解码（对READ和LIST返回值可能需要）
+    var decoded []byte
+    if resp.Data != "" {
+        d, err := base64.StdEncoding.DecodeString(resp.Data)
+        if err != nil {
+            return false, nil, "", fmt.Errorf("failed to decode response data: %v", err)
+        }
+        decoded = d
+    }
+
+    return true, decoded, "", nil
+}
+
+func (c *HydfsClient) CreateFile(path string, data []byte) error {
+    success, _, errMsg, err := c.sendRequest("CREATE", path, data)
+    if err != nil {
+        return err
+    }
+    if !success {
+        return fmt.Errorf("HyDFS CREATE failed: %s", errMsg)
+    }
+    return nil
+}
+
+func (c *HydfsClient) AppendFile(path string, data []byte) error {
+    success, _, errMsg, err := c.sendRequest("APPEND", path, data)
+    if err != nil {
+        return err
+    }
+    if !success {
+        return fmt.Errorf("HyDFS APPEND failed: %s", errMsg)
+    }
     return nil
 }
 
 func (c *HydfsClient) ReadFile(path string) ([]byte, error) {
-    if err := c.connect(); err != nil {
-        return nil, err
-    }
-
-    req := struct {
-        Op   string `json:"op"`
-        Path string `json:"path"`
-    }{
-        Op:   "READ",
-        Path: path,
-    }
-
-    resp, err := c.sendRequestWithResponse(req)
+    success, decoded, errMsg, err := c.sendRequest("READ", path, nil)
     if err != nil {
         return nil, err
     }
-
-    return resp.Data, nil
+    if !success {
+        return nil, fmt.Errorf("HyDFS READ failed: %s", errMsg)
+    }
+    return decoded, nil
 }
 
 func (c *HydfsClient) ListFiles(prefix string) ([]string, error) {
-    if err := c.connect(); err != nil {
-        return nil, err
-    }
-
-    req := struct {
-        Op     string `json:"op"`
-        Prefix string `json:"prefix"`
-    }{
-        Op:     "LIST",
-        Prefix: prefix,
-    }
-
-    resp, err := c.sendRequestWithResponse(req)
+    success, decoded, errMsg, err := c.sendRequest("LIST", prefix, nil)
     if err != nil {
         return nil, err
     }
+    if !success {
+        return nil, fmt.Errorf("HyDFS LIST failed: %s", errMsg)
+    }
 
+    // 解码的decoded数据可能是JSON数组，需要解析
     var files []string
-    if err := json.Unmarshal(resp.Data, &files); err != nil {
-        return nil, err
+    if err := json.Unmarshal(decoded, &files); err != nil {
+        return nil, fmt.Errorf("failed to unmarshal file list: %v", err)
     }
 
     return files, nil
 }
 
-func (c *HydfsClient) sendRequest(req interface{}) error {
-    _, err := c.sendRequestWithResponse(req)
-    if err != nil {
-        return err
-    }
-    return nil
+// -------------------- Worker实现 --------------------
+
+type Worker struct {
+    Config       WorkerConfig
+    Listener     net.Listener
+    StopChan     chan struct{}
+
+    State        *State
+    StateMutex   sync.RWMutex
+
+    // 输入/输出通道，实际中可能通过TCP传输，这里简化
+    InputChan    chan *Tuple
+    OutputChan   chan *Tuple
+    AckChan      chan string // 接收ACK的通道
+    LogChan      chan string
+
+    HydfsClient  *HydfsClient
+
+    Members      map[string]*MemberInfo
+    MemberMutex  sync.RWMutex
+
+    // 对于exactly-once：要有日志文件记录已处理tuples和状态
+    ProcessedLogPath string
+    StateLogPath     string
+
+    ParamX      string // 来自Config，用于操作逻辑
+
+    // 当前批处理
+    CurrentBatch *Batch
+    BatchMutex   sync.Mutex
+
+    // 用于ACK重试
+    pendingAcks  map[string]*Tuple
+    ackMutex     sync.Mutex
 }
 
-func (c *HydfsClient) sendRequestWithResponse(req interface{}) (*struct {
-    Success bool   `json:"success"`
-    Data    []byte `json:"data"`
-    Error   string `json:"error"`
-}, error) {
-    c.mutex.Lock()
-    defer c.mutex.Unlock()
-
-    encoder := json.NewEncoder(c.conn)
-    if err := encoder.Encode(req); err != nil {
-        return nil, err
-    }
-
-    var resp struct {
-        Success bool   `json:"success"`
-        Data    []byte `json:"data"`
-        Error   string `json:"error"`
-    }
-
-    decoder := json.NewDecoder(c.conn)
-    if err := decoder.Decode(&resp); err != nil {
-        return nil, err
-    }
-
-    if !resp.Success {
-        return nil, errors.New(resp.Error)
-    }
-
-    return &resp, nil
-}
-
-// Worker 方法实现
 func NewWorker(config WorkerConfig) (*Worker, error) {
     w := &Worker{
-        Config:      config,
-        ID:          config.ID,
-        Role:        config.Role,
+        Config:     config,
+        StopChan:   make(chan struct{}),
+        InputChan:  make(chan *Tuple, 1000),
+        OutputChan: make(chan *Tuple, 1000),
+        AckChan:    make(chan string, 1000),
+        LogChan:    make(chan string, 1000),
         State: &State{
-            ProcessedTuples: make(map[string]bool),
-            AggregateState:  make(map[string]interface{}),
+            ProcessedTuples: map[string]bool{},
+            AggregateState:  map[string]int{},
             LastSeqNum:      0,
         },
-        InputChan:    make(chan *Tuple, DefaultBatchSize),
-        OutputChan:   make(chan *Tuple, DefaultBatchSize),
-        LogChan:      make(chan *LogEntry, LogBufferSize),
-        StopChan:     make(chan struct{}),
-        Connections:  make(map[string]net.Conn),
-        members:      make(map[string]*MemberInfo),
+        Members:    make(map[string]*MemberInfo),
+        pendingAcks:make(map[string]*Tuple),
+        ParamX:     config.ParamX,
     }
 
-    // 初始化HydfsClient
-    hydfsClient, err := NewHydfsClient(config.HydfsAddr, config.HydfsPort)
-    if err != nil {
-        return nil, err
-    }
-    w.HydfsClient = hydfsClient
+    w.HydfsClient = &HydfsClient{Addr: config.HydfsAddr, Port: config.HydfsPort}
 
-    // 初始化日志
-    if err := w.initLogger(); err != nil {
-        return nil, err
-    }
+    // 设置日志与状态路径
+    w.ProcessedLogPath = filepath.Join("logs", w.Config.ID+"_processed.log")
+    w.StateLogPath = filepath.Join("states", w.Config.ID+"_state.log")
 
     return w, nil
 }
 
-func (w *Worker) initLogger() error {
-    if err := os.MkdirAll(w.Config.LogDir, 0755); err != nil {
-        return fmt.Errorf("failed to create log directory: %v", err)
-    }
-
-    logFile := filepath.Join(w.Config.LogDir, fmt.Sprintf("%s.log", w.ID))
-    file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-    if err != nil {
-        return fmt.Errorf("failed to open log file: %v", err)
-    }
-    w.LogFile = file
-
-    w.Logger = log.New(io.MultiWriter(os.Stdout, file), 
-        fmt.Sprintf("[%s] ", w.ID), 
-        log.LstdFlags|log.Lmicroseconds)
-
-    return nil
-}
-
 func (w *Worker) Start() error {
-    // 确保必要的目录存在
-    dirs := []string{
-        w.Config.LogDir,
-        "states",
-        "logs",
-        filepath.Join("states", w.ID),
-        filepath.Join("logs", w.ID),
-    }
-
-    for _, dir := range dirs {
-        if err := os.MkdirAll(dir, 0755); err != nil {
-            return fmt.Errorf("failed to create directory %s: %v", dir, err)
-        }
+    // 恢复状态
+    if err := w.recoverState(); err != nil {
+        log.Printf("[%s] Failed to recover state: %v\n", w.Config.ID, err)
     }
 
     // 启动网络监听
-    if err := w.startNetwork(); err != nil {
-        return err
-    }
-
-    // 启动其他服务
-    go func() {
-        defer func() {
-            if r := recover(); r != nil {
-                w.Logger.Printf("Recovered from panic in processLoop: %v", r)
-            }
-        }()
-        w.processLoop()
-    }()
-
-    go func() {
-        defer func() {
-            if r := recover(); r != nil {
-                w.Logger.Printf("Recovered from panic in logLoop: %v", r)
-            }
-        }()
-        w.logLoop()
-    }()
-
-    go func() {
-        defer func() {
-            if r := recover(); r != nil {
-                w.Logger.Printf("Recovered from panic in handleConnections: %v", r)
-            }
-        }()
-        w.handleConnections()
-    }()
-
-    w.Logger.Printf("Worker started [Role: %s]", w.Role)
-    return nil
-}
-
-
-func (w *Worker) processLoop() {
-    ticker := time.NewTicker(100 * time.Millisecond)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-w.StopChan:
-            return
-        case tuple := <-w.InputChan:
-            if err := w.processTuple(tuple); err != nil {
-                w.logError("process_tuple_failed", err)
-            }
-        case <-ticker.C:
-            w.checkAndSendBatch()
-        }
-    }
-}
-
-func (w *Worker) processTuple(tuple *Tuple) error {
-    // 检查重复
-    tupleID := fmt.Sprintf("%s-%s", tuple.Source, tuple.ID)
-    w.StateMutex.RLock()
-    if w.State.ProcessedTuples[tupleID] {
-        w.StateMutex.RUnlock()
-        w.logEvent("DUPLICATE_DETECTED", fmt.Sprintf("Duplicate tuple: %s", tupleID), nil)
-        return nil
-    }
-    w.StateMutex.RUnlock()
-
-    var result []*Tuple
-    var err error
-
-    // 根据角色处理tuple
-    switch w.Role {
-    case "source":
-        result, err = w.handleSourceTuple(tuple)
-    case "transform":
-        result, err = w.handleTransformTuple(tuple)
-    case "aggregate":
-        result, err = w.handleAggregateTuple(tuple)
-    default:
-        return fmt.Errorf("unknown role: %s", w.Role)
-    }
-
-    if err != nil {
-        return err
-    }
-
-    // 记录处理状态
-    w.StateMutex.Lock()
-    w.State.ProcessedTuples[tupleID] = true
-    w.State.LastSeqNum++
-    w.StateMutex.Unlock()
-
-    // 将结果加入批次
-    return w.addToBatch(result)
-}
-
-func (w *Worker) handleTupleMessage(msg Message) error {
-    tuple, ok := msg.Data.(*Tuple)
-    if !ok {
-        return fmt.Errorf("invalid tuple data format")
-    }
-
-    select {
-    case w.InputChan <- tuple:
-        return nil
-    case <-time.After(ProcessTimeout):
-        return ErrTimeout
-    }
-}
-
-func (w *Worker) handleBatchMessage(msg Message) error {
-    batch, ok := msg.Data.(*Batch)
-    if !ok {
-        return fmt.Errorf("invalid batch data format")
-    }
-
-    // 验证批次校验和
-    batchData, err := json.Marshal(batch.Tuples)
-    if err != nil {
-        return err
-    }
-
-    if !bytes.Equal(calculateChecksum(batchData), batch.Checksum) {
-        return fmt.Errorf("batch checksum mismatch")
-    }
-
-    for _, tuple := range batch.Tuples {
-        if err := w.processTuple(tuple); err != nil {
-            return err
-        }
-    }
-
-    return nil
-}
-
-func (w *Worker) handleStateSyncMessage(msg Message) error {
-    var state State
-    data, err := json.Marshal(msg.Data)
-    if err != nil {
-        return err
-    }
-
-    if err := json.Unmarshal(data, &state); err != nil {
-        return err
-    }
-
-    // 合并状态
-    w.StateMutex.Lock()
-    defer w.StateMutex.Unlock()
-
-    // 更新状态
-    for id := range state.ProcessedTuples {
-        w.State.ProcessedTuples[id] = true
-    }
-
-    if w.Role == "aggregate" {
-        for k, v := range state.AggregateState {
-            if current, exists := w.State.AggregateState[k]; exists {
-                w.State.AggregateState[k] = current.(int) + v.(int)
-            } else {
-                w.State.AggregateState[k] = v
-            }
-        }
-    }
-
-    return nil
-}
-
-func (w *Worker) sendMessage(targetID string, msg Message) error {
-    w.memberMutex.RLock()
-    target, exists := w.members[targetID]
-    w.memberMutex.RUnlock()
-
-    if !exists {
-        return ErrNodeNotFound
-    }
-
-    addr := fmt.Sprintf("%s:%d", target.Address, target.Port)
-    conn, err := net.DialTimeout("tcp", addr, ProcessTimeout)
-    if err != nil {
-        return fmt.Errorf("failed to connect to %s: %v", targetID, err)
-    }
-    defer conn.Close()
-
-    encoder := json.NewEncoder(conn)
-    if err := encoder.Encode(msg); err != nil {
-        return fmt.Errorf("failed to send message: %v", err)
-    }
-
-    decoder := json.NewDecoder(conn)
-    var response Message
-    if err := decoder.Decode(&response); err != nil {
-        return fmt.Errorf("failed to read response: %v", err)
-    }
-
-    if response.Type == MsgError {
-        return fmt.Errorf("remote error: %v", response.Data)
-    }
-
-    return nil
-}
-
-func (w *Worker) handleHeartbeatMessage(msg Message) error {
-    w.memberMutex.Lock()
-    defer w.memberMutex.Unlock()
-
-    if member, exists := w.members[msg.SenderID]; exists {
-        member.LastHeartbeat = msg.Timestamp
-        member.Status = StatusNormal
-    }
-
-    return nil
-}
-
-func (w *Worker) handleSourceTuple(tuple *Tuple) ([]*Tuple, error) {
-    line, ok := tuple.Value.(string)
-    if !ok {
-        return nil, fmt.Errorf("invalid source tuple value type")
-    }
-
-    // 创建新tuple
-    newTuple := &Tuple{
-        ID:        fmt.Sprintf("%s-%d", w.ID, w.State.LastSeqNum),
-        Key:       fmt.Sprintf("line-%d", w.State.LastSeqNum),
-        Value:     line,
-        Timestamp: time.Now(),
-        BatchID:   fmt.Sprintf("batch-%s-%d", w.ID, int(w.State.LastSeqNum/int64(w.Config.BatchSize))),
-        Source:    w.ID,
-    }
-
-    w.logEvent("SOURCE_PROCESSED", fmt.Sprintf("Processed source tuple: %s", newTuple.ID), nil)
-    return []*Tuple{newTuple}, nil
-}
-
-func (w *Worker) handleTransformTuple(tuple *Tuple) ([]*Tuple, error) {
-    line, ok := tuple.Value.(string)
-    if !ok {
-        return nil, fmt.Errorf("invalid transform tuple value type")
-    }
-
-    // 解析CSV行
-    reader := csv.NewReader(strings.NewReader(line))
-    fields, err := reader.Read()
-    if err != nil {
-        return nil, err
-    }
-
-    // 检查Pattern X
-    if !strings.Contains(line, w.Config.ParamX) {
-        return nil, nil
-    }
-
-    // 提取所需字段
-    if len(fields) < 4 {
-        return nil, fmt.Errorf("insufficient fields in CSV")
-    }
-
-    objectID := fields[2]
-    signType := fields[3]
-
-    // 创建结果tuple
-    newTuple := &Tuple{
-        ID:        fmt.Sprintf("%s-%d", w.ID, w.State.LastSeqNum),
-        Key:       objectID,
-        Value:     fmt.Sprintf("%s,%s", objectID, signType),
-        Timestamp: time.Now(),
-        BatchID:   tuple.BatchID,
-        Source:    w.ID,
-    }
-
-    w.logEvent("TRANSFORM_PROCESSED", fmt.Sprintf("Processed transform tuple: %s", newTuple.ID), nil)
-    return []*Tuple{newTuple}, nil
-}
-
-func (w *Worker) handleAggregateTuple(tuple *Tuple) ([]*Tuple, error) {
-    line, ok := tuple.Value.(string)
-    if !ok {
-        return nil, fmt.Errorf("invalid aggregate tuple value type")
-    }
-
-    // 解析CSV行
-    reader := csv.NewReader(strings.NewReader(line))
-    fields, err := reader.Read()
-    if err != nil {
-        return nil, err
-    }
-
-    // 检查字段数量
-    if len(fields) < 5 {
-        return nil, fmt.Errorf("insufficient fields")
-    }
-
-    // 检查Sign Post类型
-    signPost := fields[3]
-    if signPost != w.Config.ParamX {
-        return nil, nil
-    }
-
-    // 获取Category
-    category := fields[4]
-    if category == "" {
-        category = "empty"
-    } else if category == " " {
-        category = "space"
-    }
-
-    // 更新计数
-    w.StateMutex.Lock()
-    if _, exists := w.State.AggregateState[category]; !exists {
-        w.State.AggregateState[category] = 0
-    }
-    count := w.State.AggregateState[category].(int) + 1
-    w.State.AggregateState[category] = count
-    w.StateMutex.Unlock()
-
-    // 创建结果tuple
-    newTuple := &Tuple{
-        ID:        fmt.Sprintf("%s-%d", w.ID, w.State.LastSeqNum),
-        Key:       category,
-        Value:     count,
-        Timestamp: time.Now(),
-        BatchID:   tuple.BatchID,
-        Source:    w.ID,
-    }
-
-    w.logEvent("AGGREGATE_PROCESSED", 
-        fmt.Sprintf("Updated count for category %s: %d", category, count),
-        map[string]interface{}{
-            "category": category,
-            "count":   count,
-        })
-
-    return []*Tuple{newTuple}, nil
-}
-
-// 批处理和网络通信实现
-func (w *Worker) addToBatch(tuples []*Tuple) error {
-    w.BatchMutex.Lock()
-    defer w.BatchMutex.Unlock()
-
-    if w.CurrentBatch == nil {
-        w.CurrentBatch = &Batch{
-            ID:            fmt.Sprintf("batch-%s-%d", w.ID, int(w.State.LastSeqNum/int64(w.Config.BatchSize))),
-            Tuples:        make([]*Tuple, 0),
-            ProcessedIDs:  make(map[string]bool),
-            NextStageAcks: make(map[string]bool),
-            CreateTime:    time.Now(),
-        }
-    }
-
-    // 添加tuples到当前批次
-    for _, tuple := range tuples {
-        w.CurrentBatch.Tuples = append(w.CurrentBatch.Tuples, tuple)
-    }
-
-    // 如果批次已满，发送它
-    if len(w.CurrentBatch.Tuples) >= w.Config.BatchSize {
-        return w.sendBatch(w.CurrentBatch)
-    }
-
-    return nil
-}
-
-func (w *Worker) checkAndSendBatch() {
-    w.BatchMutex.Lock()
-    defer w.BatchMutex.Unlock()
-
-    if w.CurrentBatch == nil || len(w.CurrentBatch.Tuples) == 0 {
-        return
-    }
-
-    if time.Since(w.CurrentBatch.CreateTime) >= ProcessTimeout {
-        if err := w.sendBatch(w.CurrentBatch); err != nil {
-            w.logError("send_batch_failed", err)
-        }
-    }
-}
-
-func (w *Worker) sendBatch(batch *Batch) error {
-    // 计算批次校验和
-    data, err := json.Marshal(batch.Tuples)
-    if err != nil {
-        return err
-    }
-    batch.Checksum = calculateChecksum(data)
-
-    // 记录批次
-    w.logEvent("BATCH_SENDING", 
-        fmt.Sprintf("Sending batch %s with %d tuples", batch.ID, len(batch.Tuples)),
-        map[string]interface{}{
-            "batch_id":     batch.ID,
-            "tuple_count":  len(batch.Tuples),
-            "checksum":     fmt.Sprintf("%x", batch.Checksum),
-        })
-
-    // 发送到下一阶段
-    select {
-    case w.OutputChan <- &Tuple{
-        ID:        batch.ID,
-        Value:     batch,
-        Timestamp: time.Now(),
-        Source:    w.ID,
-        BatchID:   batch.ID,
-        Checksum:  batch.Checksum,
-    }:
-        w.CurrentBatch = nil
-        return nil
-    case <-time.After(ProcessTimeout):
-        return ErrTimeout
-    }
-}
-
-// 网络通信相关
-func (w *Worker) startNetwork() error {
     addr := fmt.Sprintf("%s:%d", w.Config.Addr, w.Config.Port)
-    listener, err := net.Listen("tcp", addr)
+    ln, err := net.Listen("tcp", addr)
     if err != nil {
-        return fmt.Errorf("failed to start listener: %v", err)
+        return err
     }
-    w.Listener = listener
+    w.Listener = ln
 
-    w.logEvent("NETWORK_STARTED", 
-        fmt.Sprintf("Started network listener on %s", addr),
-        nil)
+    go w.acceptLoop()
+    go w.processLoop()
+    go w.outputLoop()
+    go w.ackLoop()
+    go w.statePersistenceLoop()
+
+    log.Printf("[%s] Worker started at %s (stage=%s)\n", w.Config.ID, addr, w.Config.Stage)
 
     return nil
 }
 
-func (w *Worker) handleConnections() {
+func (w *Worker) acceptLoop() {
     for {
         conn, err := w.Listener.Accept()
         if err != nil {
@@ -867,7 +368,7 @@ func (w *Worker) handleConnections() {
             case <-w.StopChan:
                 return
             default:
-                w.logError("accept_error", err)
+                log.Printf("[%s] Accept error: %v\n", w.Config.ID, err)
                 continue
             }
         }
@@ -877,586 +378,747 @@ func (w *Worker) handleConnections() {
 
 func (w *Worker) handleConnection(conn net.Conn) {
     defer conn.Close()
-
-    conn.SetDeadline(time.Now().Add(ProcessTimeout))
-
     decoder := json.NewDecoder(conn)
     var msg Message
     if err := decoder.Decode(&msg); err != nil {
-        w.logError("decode_error", err)
+        w.sendError(conn, err.Error())
         return
     }
 
-    response := w.processMessage(msg)  
-
-    encoder := json.NewEncoder(conn)
-    if err := encoder.Encode(response); err != nil {
-        w.logError("encode_error", err)
-    }
-}
-
-func (w *Worker) processMessage(msg Message) Message {  // 明确指定返回类型为Message
-    w.logEvent("MESSAGE_RECEIVED", 
-        fmt.Sprintf("Received message type %s from %s", msg.Type, msg.SenderID),
-        nil)
-
-    var response Message
-    response.Type = MsgAck
-    response.SenderID = w.ID
-    response.Timestamp = time.Now()
-
-    var err error
     switch msg.Type {
     case MsgTuple:
-        err = w.handleTupleMessage(msg)
+        // 单tuple直接处理
+        data, _ := json.Marshal(msg.Data)
+        var tuple Tuple
+        json.Unmarshal(data, &tuple)
+        w.InputChan <- &tuple
+        w.sendAck(conn, "received")
     case MsgBatch:
-        err = w.handleBatchMessage(msg)
-    case MsgStateSync:
-        err = w.handleStateSyncMessage(msg)
-    case MsgHeartbeat:
-        err = w.handleHeartbeatMessage(msg)
-    default:
-        err = fmt.Errorf("unknown message type: %s", msg.Type)
-    }
-
-    if err != nil {
-        return Message{
-            Type:      MsgError,
-            SenderID:  w.ID,
-            Timestamp: time.Now(),
-            Data:      err.Error(),
+        // 批次处理
+        data, _ := json.Marshal(msg.Data)
+        var batch Batch
+        json.Unmarshal(data, &batch)
+        for _, t := range batch.Tuples {
+            w.InputChan <- t
         }
+        w.sendAck(conn, "batch_received")
+    case MsgAck:
+        // 收到下游的ACK
+        id, ok := msg.Data.(string)
+        if ok {
+            w.AckChan <- id
+        }
+        w.sendAck(conn, "ack_received")
+    case MsgHeartbeat:
+        // 心跳回复
+        w.sendAck(conn, "alive")
+    case MsgTaskAssign:
+        // Leader给Worker分配任务（可以设定Stage, source file partition等）
+        w.applyTaskAssignment(msg.Data)
+        w.sendAck(conn, "task_assigned")
+    case MsgTaskReassign:
+        // 任务重分配
+        w.applyTaskAssignment(msg.Data)
+        w.sendAck(conn, "task_reassigned")
+    case MsgStateSync:
+        w.handleStateSync(msg.Data)
+        w.sendAck(conn, "state_synced")
+    default:
+        w.sendError(conn, "unknown message type")
     }
-
-    return response
 }
 
-// 状态同步和故障恢复实现
-func (w *Worker) stateSync() {
-    ticker := time.NewTicker(StateCheckInterval)
-    defer ticker.Stop()
+func (w *Worker) sendError(conn net.Conn, errMsg string) {
+    resp := Message{
+        Type:      MsgError,
+        SenderID:  w.Config.ID,
+        Timestamp: time.Now(),
+        Data:      errMsg,
+    }
+    json.NewEncoder(conn).Encode(resp)
+}
 
+func (w *Worker) sendAck(conn net.Conn, data interface{}) {
+    resp := Message{
+        Type:      MsgAck,
+        SenderID:  w.Config.ID,
+        Timestamp: time.Now(),
+        Data:      data,
+    }
+    json.NewEncoder(conn).Encode(resp)
+}
+
+func (w *Worker) applyTaskAssignment(data interface{}) {
+    // 根据数据更新自身的Stage、数据文件分区、ParamX等信息
+    // 简化处理：假设data里有stage、paramX等
+    m, ok := data.(map[string]interface{})
+    if ok {
+        if stg, ok := m["stage"].(string); ok {
+            w.Config.Stage = stg
+        }
+        if px, ok := m["paramX"].(string); ok {
+            w.ParamX = px
+        }
+        if src, ok := m["src_file"].(string); ok {
+            w.Config.SrcFile = src
+        }
+        if dst, ok := m["dest_file"].(string); ok {
+            w.Config.DestFile = dst
+        }
+        // 可根据NumTasks等配置进行初始化
+    }
+    log.Printf("[%s] Task assigned: stage=%s paramX=%s src=%s dest=%s\n",
+        w.Config.ID, w.Config.Stage, w.ParamX, w.Config.SrcFile, w.Config.DestFile)
+}
+
+func (w *Worker) handleStateSync(data interface{}) {
+    // 从data中提取要合并的状态（对有状态task，如aggregate）
+    // 比如data里有category和count
+    m, ok := data.(map[string]interface{})
+    if !ok {
+        return
+    }
+    if w.Config.Stage == StageAggregate {
+        cat, cok := m["category"].(string)
+        cnt, iok := m["count"].(float64)
+        if cok && iok {
+            w.StateMutex.Lock()
+            w.State.AggregateState[cat] = w.State.AggregateState[cat] + int(cnt)
+            w.StateMutex.Unlock()
+            log.Printf("[%s] State synced: %s += %d\n", w.Config.ID, cat, int(cnt))
+        }
+    }
+}
+
+func (w *Worker) processLoop() {
+    // 根据stage处理tuple
     for {
         select {
         case <-w.StopChan:
             return
-        case <-ticker.C:
-            if err := w.persistState(); err != nil {
-                w.logError("state_sync_failed", err)
+        case t := <-w.InputChan:
+            w.processTuple(t)
+        }
+    }
+}
+
+func (w *Worker) processTuple(tuple *Tuple) {
+    // Exactly-once：检查是否已处理过
+    w.StateMutex.RLock()
+    if w.State.ProcessedTuples[tuple.ID] {
+        w.StateMutex.RUnlock()
+        // 丢弃重复
+        return
+    }
+    w.StateMutex.RUnlock()
+
+    // 未处理过，执行操作
+    var results []*Tuple
+    switch w.Config.Stage {
+    case StageSource:
+        // Source: 从HyDFS中读数据行，然后发往下游(实际中source是主动读文件而不是被动接收，这里简化)
+        // 在demo中source将从SrcFile读行并产出tuple
+        // 这里假设已经拿到tuple是文件的一行记录
+        // Source的工作在真实系统中是持续读文件并发送下游，这里仅示意
+        // 此处假设tuple.Value就是一行
+        results = []*Tuple{tuple}
+    case StageTransform:
+        // Transform: 对行进行过滤，若包含ParamX则输出 (OBJECTID,Sign_Type)
+        line, _ := tuple.Value.(string)
+        if strings.Contains(line, w.ParamX) {
+            // CSV解析
+            reader := csv.NewReader(strings.NewReader(line))
+            record, err := reader.Read()
+            if err == nil && len(record) > 3 {
+                objectID := record[2]
+                signType := record[3]
+                val := fmt.Sprintf("%s,%s", objectID, signType)
+                outTuple := &Tuple{
+                    ID: fmt.Sprintf("%s-%d", w.Config.ID, w.State.LastSeqNum),
+                    Key: objectID,
+                    Value: val,
+                    Timestamp: time.Now(),
+                    Source: w.Config.ID,
+                }
+                results = []*Tuple{outTuple}
+            }
+        }
+    case StageAggregate:
+        // Aggregate: 对特定Sign Post类型的记录，根据Category计数
+        line, _ := tuple.Value.(string)
+        reader := csv.NewReader(strings.NewReader(line))
+        record, err := reader.Read()
+        if err == nil && len(record) > 4 {
+            signPost := record[3]
+            category := record[4]
+            if category == "" {
+                category = "empty"
+            } else if category == " " {
+                category = "space"
+            }
+            if signPost == w.ParamX {
+                // increment count
+                w.StateMutex.Lock()
+                w.State.AggregateState[category] = w.State.AggregateState[category] + 1
+                count := w.State.AggregateState[category]
+                w.StateMutex.Unlock()
+                outTuple := &Tuple{
+                    ID: fmt.Sprintf("%s-%d", w.Config.ID, w.State.LastSeqNum),
+                    Key: category,
+                    Value: count,
+                    Timestamp: time.Now(),
+                    Source: w.Config.ID,
+                }
+                results = []*Tuple{outTuple}
+            }
+        }
+    default:
+        // 未知stage不处理
+        return
+    }
+
+    // 标记已处理
+    w.StateMutex.Lock()
+    w.State.ProcessedTuples[tuple.ID] = true
+    w.State.LastSeqNum++
+    w.StateMutex.Unlock()
+
+    // 结果发送到OutputChan
+    for _, r := range results {
+        w.OutputChan <- r
+    }
+}
+
+func (w *Worker) outputLoop() {
+    // 将OutputChan中的tuple发送到下游（或最终输出）
+    // 在最终stage（aggregate）中输出到console和HyDFS
+    // 在中间stage发送给下游Worker
+
+    // 实际中需要由Leader给出下游节点列表，这里简化为通过Stage判断
+    // 假设固定拓扑: source -> transform -> aggregate
+    // Leader将给每个Worker一个下游节点列表（在applyTaskAssignment中可加入）
+    // 此处简化，假设如果是aggregate就输出到console和dest file，否则发给下一个stage（leader会提供下游地址）
+
+    var nextStageNodes []MemberInfo
+    var isFinalStage bool
+    // 简化逻辑，根据Stage判断：source发给transform，transform发给aggregate，aggregate输出最终结果
+    for {
+        select {
+        case <-w.StopChan:
+            return
+        case t := <-w.OutputChan:
+            if w.Config.Stage == StageSource {
+                // 找transform节点发送
+                nextStageNodes = w.getStageNodes(StageTransform)
+            } else if w.Config.Stage == StageTransform {
+                // 找aggregate节点发送
+                nextStageNodes = w.getStageNodes(StageAggregate)
+            } else if w.Config.Stage == StageAggregate {
+                // 最终输出
+                isFinalStage = true
+            }
+
+            if isFinalStage {
+                // 输出到console并写入HyDFS文件
+                fmt.Printf("[%s] FINAL OUTPUT: %s=%v\n", w.Config.ID, t.Key, t.Value)
+                if w.Config.DestFile != "" {
+                    // 将结果append到DestFile
+                    line := fmt.Sprintf("%s,%v\n", t.Key, t.Value)
+                    w.HydfsClient.AppendFile(w.Config.DestFile, []byte(line))
+                }
+                // ack不需要发送给下游，因为没有下游
+            } else {
+                // 发送给下游阶段的任务（hash分区）
+                if len(nextStageNodes) > 0 {
+                    target := w.chooseNodeForTuple(nextStageNodes, t.Key)
+                    // 发送tuple给target
+                    if err := w.sendTuple(target, t); err != nil {
+                        log.Printf("[%s] Failed to send tuple to %s: %v\n", w.Config.ID, target.ID, err)
+                    } else {
+                        // 等ACK
+                        w.addPendingAck(t)
+                    }
+                }
             }
         }
     }
 }
 
-func (w *Worker) persistState() error {
-    w.StateMutex.RLock()
-    state := *w.State // 创建状态副本
-    w.StateMutex.RUnlock()
-
-    // 序列化状态
-    stateData, err := json.Marshal(state)
-    if err != nil {
-        return fmt.Errorf("failed to marshal state: %v", err)
+func (w *Worker) ackLoop() {
+    // 处理下游ACK，去除pendingAcks
+    for {
+        select {
+        case <-w.StopChan:
+            return
+        case ackID := <-w.AckChan:
+            w.removePendingAck(ackID)
+        }
     }
+}
 
-    // 计算校验和
-    stateChecksum := calculateChecksum(stateData)
+func (w *Worker) addPendingAck(t *Tuple) {
+    w.ackMutex.Lock()
+    w.pendingAcks[t.ID] = t
+    w.ackMutex.Unlock()
+    go w.retryOnTimeout(t)
+}
 
-    // 创建状态文件名
-    stateFile := fmt.Sprintf("states/%s/%d.state", w.ID, time.Now().UnixNano())
+func (w *Worker) removePendingAck(id string) {
+    w.ackMutex.Lock()
+    delete(w.pendingAcks, id)
+    w.ackMutex.Unlock()
+}
 
-    // 确保目录存在
-    if err := w.HydfsClient.ensureDirectory("states/" + w.ID); err != nil {
-        return err
+func (w *Worker) retryOnTimeout(t *Tuple) {
+    // 如果在指定时间内未收到ACK，重发
+    timer := time.NewTimer(ProcessTimeout)
+    defer timer.Stop()
+    <-timer.C
+    w.ackMutex.Lock()
+    _, stillPending := w.pendingAcks[t.ID]
+    w.ackMutex.Unlock()
+    if stillPending {
+        // 重发
+        // 找下游节点
+        nextStageNodes := w.getStageNodesForResend()
+        if len(nextStageNodes) > 0 {
+            target := w.chooseNodeForTuple(nextStageNodes, t.Key)
+            if err := w.sendTuple(target, t); err != nil {
+                log.Printf("[%s] Retry send failed: %v\n", w.Config.ID, err)
+            } else {
+                // 再次等待ACK
+                go w.retryOnTimeout(t)
+            }
+        }
     }
+}
 
-    // 写入HyDFS
-    if err := w.HydfsClient.CreateFile(stateFile, stateData); err != nil {
-        return fmt.Errorf("failed to persist state: %v", err)
+func (w *Worker) getStageNodes(stage string) []MemberInfo {
+    w.MemberMutex.RLock()
+    defer w.MemberMutex.RUnlock()
+    var nodes []MemberInfo
+    for _, m := range w.Members {
+        if m.Stage == stage && m.Status == StatusNormal {
+            nodes = append(nodes, *m)
+        }
     }
+    return nodes
+}
 
-    w.logEvent("STATE_PERSISTED", 
-        fmt.Sprintf("State persisted to %s", stateFile),
-        map[string]interface{}{
-            "checksum":     fmt.Sprintf("%x", stateChecksum),
-            "size":         len(stateData),
-            "last_seq_num": state.LastSeqNum,
-        })
-
+func (w *Worker) getStageNodesForResend() []MemberInfo {
+    // 重发时使用相同逻辑
+    if w.Config.Stage == StageSource {
+        return w.getStageNodes(StageTransform)
+    } else if w.Config.Stage == StageTransform {
+        return w.getStageNodes(StageAggregate)
+    }
     return nil
 }
 
-func (c *HydfsClient) ensureDirectory(path string) error {
-    req := struct {
-        Op   string `json:"op"`
-        Path string `json:"path"`
-    }{
-        Op:   "MKDIR",
-        Path: path,
+func (w *Worker) chooseNodeForTuple(nodes []MemberInfo, key string) MemberInfo {
+    // 简单hash分区
+    h := fnv.New32a()
+    h.Write([]byte(key))
+    idx := int(h.Sum32()) % len(nodes)
+    return nodes[idx]
+}
+
+func (w *Worker) sendTuple(target MemberInfo, t *Tuple) error {
+    addr := fmt.Sprintf("%s:%d", target.Address, target.Port)
+    conn, err := net.DialTimeout("tcp", addr, ProcessTimeout)
+    if err != nil {
+        return err
     }
-    
-    return c.sendRequest(req)
+    defer conn.Close()
+
+    msg := Message{
+        Type:      MsgTuple,
+        SenderID:  w.Config.ID,
+        Timestamp: time.Now(),
+        Data:      t,
+    }
+    if err := json.NewEncoder(conn).Encode(msg); err != nil {
+        return err
+    }
+
+    // 等回复
+    var resp Message
+    if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+        return err
+    }
+    if resp.Type == MsgError {
+        return errors.New("received remote error: " + fmt.Sprintf("%v", resp.Data))
+    }
+    return nil
+}
+
+func (w *Worker) statePersistenceLoop() {
+    ticker := time.NewTicker(StateCheckInterval)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-w.StopChan:
+            return
+        case <-ticker.C:
+            w.persistState()
+        }
+    }
+}
+
+func (w *Worker) persistState() {
+    w.StateMutex.RLock()
+    data, _ := json.Marshal(w.State)
+    w.StateMutex.RUnlock()
+    stateFile := filepath.Join("states", w.Config.ID+"_state.log")
+
+    if err := w.HydfsClient.AppendFile(stateFile, data); err != nil {
+        log.Printf("[%s] Failed to persist state: %v\n", w.Config.ID, err)
+    }
 }
 
 func (w *Worker) recoverState() error {
-    // 获取最新的状态文件
-    stateFiles, err := w.HydfsClient.ListFiles("states/" + w.ID)
-    if err != nil {
-        return fmt.Errorf("failed to list state files: %v", err)
-    }
-
-    if len(stateFiles) == 0 {
-        w.logEvent("STATE_RECOVERY", "No previous state found", nil)
+    stateFile := filepath.Join("states", w.Config.ID+"_state.log")
+    data, err := w.HydfsClient.ReadFile(stateFile)
+    if err != nil || len(data)==0 {
         return nil
     }
-
-    // 获取最新的状态文件
-    latestFile := stateFiles[len(stateFiles)-1]
-    stateData, err := w.HydfsClient.ReadFile(latestFile)
-    if err != nil {
-        return fmt.Errorf("failed to read state file: %v", err)
+    // 假设最后一行是最新的state
+    lines := bytes.Split(data, []byte("\n"))
+    if len(lines) == 0 {
+        return nil
     }
-
-    // 反序列化状态
-    var state State
-    if err := json.Unmarshal(stateData, &state); err != nil {
-        return fmt.Errorf("failed to unmarshal state: %v", err)
+    line := lines[len(lines)-1]
+    var st State
+    if err := json.Unmarshal(line, &st); err != nil {
+        return err
     }
-
-    // 验证状态一致性
-    if err := w.validateState(&state); err != nil {
-        return fmt.Errorf("state validation failed: %v", err)
-    }
-
-    // 更新当前状态
     w.StateMutex.Lock()
-    w.State = &state
+    w.State = &st
     w.StateMutex.Unlock()
-
-    w.logEvent("STATE_RECOVERED", 
-        fmt.Sprintf("State recovered from %s", latestFile),
-        map[string]interface{}{
-            "last_seq_num":   state.LastSeqNum,
-            "tuples_count":   len(state.ProcessedTuples),
-            "aggregate_keys": len(state.AggregateState),
-        })
-
     return nil
 }
 
-func (w *Worker) validateState(state *State) error {
-    if state.ProcessedTuples == nil {
-        state.ProcessedTuples = make(map[string]bool)
-    }
-    if state.AggregateState == nil {
-        state.AggregateState = make(map[string]interface{})
-    }
+// -------------------- Leader实现 --------------------
 
-    // 对于聚合角色，验证计数值的有效性
-    if w.Role == "aggregate" {
-        for category, value := range state.AggregateState {
-            count, ok := value.(float64) // JSON反序列化后数字默认为float64
-            if !ok {
-                return fmt.Errorf("invalid count type for category %s", category)
-            }
-            if count < 0 {
-                return fmt.Errorf("invalid count value %f for category %s", count, category)
-            }
-            // 将float64转换回int
-            state.AggregateState[category] = int(count)
-        }
-    }
+type Leader struct {
+    Config     WorkerConfig
+    Listener   net.Listener
+    StopChan   chan struct{}
 
+    Members    map[string]*MemberInfo
+    MemberMutex sync.RWMutex
+
+    HydfsClient *HydfsClient
+}
+
+func NewLeader(config WorkerConfig) (*Leader, error) {
+    l := &Leader{
+        Config:    config,
+        StopChan:  make(chan struct{}),
+        Members:   make(map[string]*MemberInfo),
+        HydfsClient: &HydfsClient{Addr: config.HydfsAddr, Port: config.HydfsPort},
+    }
+    return l, nil
+}
+
+func (l *Leader) Start() error {
+    addr := fmt.Sprintf("%s:%d", l.Config.Addr, l.Config.Port)
+    ln, err := net.Listen("tcp", addr)
+    if err != nil {
+        return err
+    }
+    l.Listener = ln
+    go l.acceptLoop()
+    go l.heartbeatLoop()
+    go l.assignInitialTasks()
+
+    log.Printf("[LEADER] started at %s\n", addr)
     return nil
 }
 
-// 故障检测和恢复
-func (w *Worker) monitorPeers() {
-    ticker := time.NewTicker(HeartbeatInterval)
-    defer ticker.Stop()
-
+func (l *Leader) acceptLoop() {
     for {
-        select {
-        case <-w.StopChan:
-            return
-        case <-ticker.C:
-            w.checkPeerHealth()
+        conn, err := l.Listener.Accept()
+        if err != nil {
+            select {
+            case <-l.StopChan:
+                return
+            default:
+                log.Printf("[LEADER] Accept error: %v\n", err)
+                continue
+            }
         }
+        go l.handleConnection(conn)
     }
 }
 
-func (w *Worker) checkPeerHealth() {
-    w.memberMutex.Lock()
-    defer w.memberMutex.Unlock()
-
-    now := time.Now()
-    for id, member := range w.members {
-        if id == w.ID {
-            continue
-        }
-
-        if member.Status == StatusNormal && 
-           now.Sub(member.LastHeartbeat) > FailureTimeout {
-            // 标记为失败
-            member.Status = StatusFailed
-            w.logEvent("PEER_FAILED", 
-                fmt.Sprintf("Peer %s marked as failed", id),
-                map[string]interface{}{
-                    "last_heartbeat": member.LastHeartbeat,
-                    "timeout":        FailureTimeout,
-                })
-
-            // 触发故障恢复
-            go w.handlePeerFailure(id)
-        }
-    }
-}
-
-func (w *Worker) handlePeerFailure(failedID string) {
-    // 记录故障处理开始
-    w.logEvent("FAILURE_RECOVERY_STARTED", 
-        fmt.Sprintf("Starting recovery for failed peer %s", failedID),
-        nil)
-
-    // 如果是聚合角色，需要重新分配状态
-    if w.Role == "aggregate" {
-        if err := w.redistributeState(failedID); err != nil {
-            w.logError("state_redistribution_failed", err)
-            return
-        }
-    }
-
-    // 重新分配任务
-    if err := w.reassignTasks(failedID); err != nil {
-        w.logError("task_reassignment_failed", err)
+func (l *Leader) handleConnection(conn net.Conn) {
+    defer conn.Close()
+    decoder := json.NewDecoder(conn)
+    var msg Message
+    if err := decoder.Decode(&msg); err != nil {
+        l.sendError(conn, err.Error())
         return
     }
 
-    w.logEvent("FAILURE_RECOVERY_COMPLETED", 
-        fmt.Sprintf("Completed recovery for failed peer %s", failedID),
-        nil)
+    switch msg.Type {
+    case MsgHeartbeat:
+        l.updateHeartbeat(msg.SenderID)
+        l.sendAck(conn, "alive")
+    case MsgError:
+        // 接收来自worker的错误信息
+        l.sendAck(conn, "noted")
+    default:
+        l.sendError(conn, "unknown message type for leader")
+    }
 }
 
-func (w *Worker) reassignTasks(failedID string) error {
-    // 获取活跃节点列表
-    activeNodes := make([]string, 0)
-    w.memberMutex.RLock()
-    for id, member := range w.members {
-        if id != failedID && member.Status == StatusNormal {
-            activeNodes = append(activeNodes, id)
-        }
-    }
-    w.memberMutex.RUnlock()
-
-    if len(activeNodes) == 0 {
-        return errors.New("no active nodes available for task reassignment")
-    }
-
-    // 通知其他节点重新分配任务
-    msg := Message{
-        Type:      "TASK_REASSIGN",
-        SenderID:  w.ID,
+func (l *Leader) sendError(conn net.Conn, errMsg string) {
+    resp := Message{
+        Type:      MsgError,
+        SenderID:  l.Config.ID,
         Timestamp: time.Now(),
-        Data: map[string]interface{}{
-            "failed_node": failedID,
-        },
+        Data:      errMsg,
     }
-
-    for _, nodeID := range activeNodes {
-        if err := w.sendMessage(nodeID, msg); err != nil {
-            w.logError("task_reassignment_failed", 
-                fmt.Errorf("failed to notify %s: %v", nodeID, err))
-        }
-    }
-
-    return nil
+    json.NewEncoder(conn).Encode(resp)
 }
 
-
-func (w *Worker) redistributeState(failedID string) error {
-    w.StateMutex.Lock()
-    defer w.StateMutex.Unlock()
-
-    // 获取活跃节点列表
-    activeNodes := make([]string, 0)
-    w.memberMutex.RLock()
-    for id, member := range w.members {
-        if id != failedID && member.Status == StatusNormal {
-            activeNodes = append(activeNodes, id)
-        }
+func (l *Leader) sendAck(conn net.Conn, data interface{}) {
+    resp := Message{
+        Type:      MsgAck,
+        SenderID:  l.Config.ID,
+        Timestamp: time.Now(),
+        Data:      data,
     }
-    w.memberMutex.RUnlock()
-
-    if len(activeNodes) == 0 {
-        return errors.New("no active nodes available for state redistribution")
-    }
-
-    // 重新分配状态
-    for category, count := range w.State.AggregateState {
-        // 使用一致性哈希或简单的取模来决定新的负责节点
-        targetNode := activeNodes[int(hashString(category))%len(activeNodes)]
-        if targetNode == w.ID {
-            continue // 已经在当前节点上
-        }
-
-        // 发送状态更新消息给目标节点
-        msg := Message{
-            Type:      MsgStateSync,
-            SenderID:  w.ID,
-            Timestamp: time.Now(),
-            Data: map[string]interface{}{
-                "category": category,
-                "count":    count,
-            },
-        }
-
-        if err := w.sendMessage(targetNode, msg); err != nil {
-            return fmt.Errorf("failed to redistribute state to %s: %v", targetNode, err)
-        }
-    }
-
-    return nil
+    json.NewEncoder(conn).Encode(resp)
 }
 
-func hashString(s string) uint32 {
-    h := fnv.New32a()
-    h.Write([]byte(s))
-    return h.Sum32()
+func (l *Leader) updateHeartbeat(id string) {
+    l.MemberMutex.Lock()
+    defer l.MemberMutex.Unlock()
+    if m, ok := l.Members[id]; ok {
+        m.LastHeartbeat = time.Now()
+        m.Status = StatusNormal
+    }
 }
 
-
-// 日志记录实现
-func (w *Worker) logLoop() {
+func (l *Leader) heartbeatLoop() {
+    ticker := time.NewTicker(HeartbeatInterval)
+    defer ticker.Stop()
     for {
         select {
-        case <-w.StopChan:
+        case <-l.StopChan:
             return
-        case entry := <-w.LogChan:
-            if err := w.writeLog(entry); err != nil {
-                w.Logger.Printf("Warning: Failed to write log: %v", err)
-            }
+        case <-ticker.C:
+            l.checkMembers()
         }
     }
 }
 
-func (w *Worker) writeLog(entry *LogEntry) error {
-    logData, err := json.Marshal(entry)
+func (l *Leader) checkMembers() {
+    l.MemberMutex.Lock()
+    defer l.MemberMutex.Unlock()
+    now := time.Now()
+    for _, m := range l.Members {
+        if m.Status == StatusNormal && now.Sub(m.LastHeartbeat) > FailureTimeout {
+            m.Status = StatusFailed
+            // 重新分配任务
+            go l.reassignTasks(m.ID)
+        }
+    }
+}
+
+func (l *Leader) assignInitialTasks() {
+    // 从ClusterFile读取所有worker信息并分配任务
+    // 简化处理：假设已有source,transform,aggregate各若干worker
+    // 实际需根据NumTasks和Hydfs_src_file分块
+    time.Sleep(2*time.Second) // 等待所有worker上线
+    l.MemberMutex.Lock()
+    defer l.MemberMutex.Unlock()
+
+    // 简单分配：选几个worker为source, transform, aggregate
+    var sources, transforms, aggregates []MemberInfo
+    for _, m := range l.Members {
+        if strings.Contains(m.ID, "src") {
+            sources = append(sources, *m)
+        } else if strings.Contains(m.ID, "transform") {
+            transforms = append(transforms, *m)
+        } else if strings.Contains(m.ID, "agg") {
+            aggregates = append(aggregates, *m)
+        }
+    }
+
+    // 给source分配src_file和paramX
+    for i, src := range sources {
+        data := map[string]interface{}{
+            "stage": StageSource,
+            "paramX": l.Config.ParamX,
+            "src_file": l.Config.SrcFile,
+            "dest_file": l.Config.DestFile,
+        }
+        l.sendTaskAssign(src, data)
+        // 简化：实际应对多分片输入文件进行分配
+        _ = i
+    }
+
+    // transform
+    for _, tr := range transforms {
+        data := map[string]interface{}{
+            "stage": StageTransform,
+            "paramX": l.Config.ParamX,
+        }
+        l.sendTaskAssign(tr, data)
+    }
+
+    // aggregate
+    for _, ag := range aggregates {
+        data := map[string]interface{}{
+            "stage": StageAggregate,
+            "paramX": l.Config.ParamX,
+            "dest_file": l.Config.DestFile,
+        }
+        l.sendTaskAssign(ag, data)
+    }
+
+    log.Printf("[LEADER] Initial tasks assigned.\n")
+}
+
+func (l *Leader) sendTaskAssign(m MemberInfo, data interface{}) {
+    l.sendMessage(m, MsgTaskAssign, data)
+}
+
+func (l *Leader) reassignTasks(failedID string) {
+    log.Printf("[LEADER] Reassigning tasks from failed node %s\n", failedID)
+
+    // 简化：从failedID中恢复任务到其他正常节点
+    // 实际应从HyDFS日志中恢复状态并发送给其他worker
+    // 此处只演示流程
+
+    // 找到与failedID相同stage的另一个正常节点并同步状态
+    l.MemberMutex.Lock()
+    defer l.MemberMutex.Unlock()
+
+    failedStage := ""
+    for _, m := range l.Members {
+        if m.ID == failedID {
+            failedStage = m.Stage
+            break
+        }
+    }
+
+    var target *MemberInfo
+    for _, m := range l.Members {
+        if m.ID != failedID && m.Stage == failedStage && m.Status == StatusNormal {
+            target = m
+            break
+        }
+    }
+
+    if target == nil {
+        log.Printf("[LEADER] No active node to reassign tasks for stage %s\n", failedStage)
+        return
+    }
+
+    data := map[string]interface{}{
+        "stage": failedStage,
+        "paramX": l.Config.ParamX,
+        "src_file": l.Config.SrcFile,
+        "dest_file": l.Config.DestFile,
+    }
+    l.sendMessage(*target, MsgTaskReassign, data)
+}
+
+func (l *Leader) sendMessage(m MemberInfo, msgType string, data interface{}) {
+    addr := fmt.Sprintf("%s:%d", m.Address, m.Port)
+    conn, err := net.DialTimeout("tcp", addr, ProcessTimeout)
     if err != nil {
-        return fmt.Errorf("failed to marshal log entry: %v", err)
+        log.Printf("[LEADER] Failed to connect %s: %v\n", m.ID, err)
+        return
     }
+    defer conn.Close()
 
-    if _, err := fmt.Fprintln(w.LogFile, string(logData)); err != nil {
-        return fmt.Errorf("failed to write to local log file: %v", err)
-    }
-
-    if w.HydfsClient == nil {
-        return nil
-    }
-
-    logDir := fmt.Sprintf("logs/%s", w.ID)
-    logPath := filepath.Join(logDir, time.Now().Format("2006-01-02")+".log")
-
-    if err := w.HydfsClient.AppendFile(logPath, append(logData, '\n')); err != nil {
-        w.Logger.Printf("Warning: Failed to write log to HyDFS: %v", err)
-        return nil  
-    }
-
-    return nil
-}
-
-func (w *Worker) logEvent(eventType, message string, data interface{}) {
-    var jsonData json.RawMessage
-    if data != nil {
-        if rawData, err := json.Marshal(data); err == nil {
-            jsonData = rawData
-        }
-    }
-    entry := &LogEntry{
+    msg := Message{
+        Type: msgType,
+        SenderID: l.Config.ID,
         Timestamp: time.Now(),
-        Level:     "INFO",
-        Type:      eventType,
-        Message:   message,
-        Data:      jsonData,
+        Data: data,
     }
-    select {
-    case w.LogChan <- entry:
-    default:
-        w.Logger.Printf("[%s] %s: %s", eventType, message, string(jsonData))
+    if err := json.NewEncoder(conn).Encode(msg); err != nil {
+        log.Printf("[LEADER] sendMessage error: %v\n", err)
+    }
+
+    var resp Message
+    if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+        log.Printf("[LEADER] read response error: %v\n", err)
     }
 }
 
-func (w *Worker) logError(errType string, err error) {
-    select {
-    case w.LogChan <- &LogEntry{
-        Timestamp: time.Now(),
-        Level:     "ERROR",
-        Type:      errType,
-        Message:   err.Error(),
-    }:
-    default:
-        w.Logger.Printf("Warning: Log channel full, dropped error: %s - %v", errType, err)
-    }
-}
+// -------------------- 主函数 --------------------
 
-// 主程序
+var (
+    nodeID     = flag.String("id", "", "Node ID")
+    role       = flag.String("role", "", "Role: leader/worker")
+    addr       = flag.String("addr", "localhost", "Listen address")
+    port       = flag.Int("port", 5000, "Listen port")
+    paramX     = flag.String("param-x", "", "Param X")
+    hydfsAddr  = flag.String("hydfs-addr", "localhost", "HyDFS addr")
+    hydfsPort  = flag.Int("hydfs-port", 5001, "HyDFS port")
+    logDir     = flag.String("log-dir", "logs", "Log directory")
+    srcFile    = flag.String("src", "", "Source file path")
+    destFile   = flag.String("dest", "", "Destination file path")
+    numTasks   = flag.Int("tasks", 3, "Number of tasks")
+    clusterFile= flag.String("cluster-file", "cluster.conf", "Cluster config file")
+)
+
 func main() {
-    // 解析命令行参数
-    options := parseCommandLine()
-    if err := validateOptions(options); err != nil {
-        log.Fatalf("Invalid options: %v", err)
-    }
-
-    // 创建工作目录
-    if err := createWorkDirs(options); err != nil {
-        log.Fatalf("Failed to create work directories: %v", err)
-    }
-
-    // 根据角色启动不同类型的节点
-    switch options.Role {
-    case "leader":
-        if err := runLeader(options); err != nil {
-            log.Fatalf("Leader failed: %v", err)
-        }
-    case "worker":
-        if err := runWorker(options); err != nil {
-            log.Fatalf("Worker failed: %v", err)
-        }
-    default:
-        log.Fatalf("Unknown role: %s", options.Role)
-    }
-}
-
-func parseCommandLine() *CommandLineOptions {
-    opts := &CommandLineOptions{}
-    
-    flag.StringVar(&opts.NodeID, "id", "", "Node ID")
-    flag.StringVar(&opts.Role, "role", "", "Node role (leader/worker)")
-    flag.StringVar(&opts.Addr, "addr", "localhost", "Listen address")
-    flag.IntVar(&opts.Port, "port", BasePort, "Listen port")
-    flag.StringVar(&opts.SourceFile, "src", "", "Source file path")
-    flag.StringVar(&opts.DestFile, "dest", "", "Destination file path")
-    flag.IntVar(&opts.NumTasks, "tasks", 3, "Number of tasks")
-    flag.StringVar(&opts.ParamX, "param-x", "", "Parameter X value")
-    flag.StringVar(&opts.HydfsAddr, "hydfs-addr", "localhost", "HyDFS server address")
-    flag.IntVar(&opts.HydfsPort, "hydfs-port", FileServerPort, "HyDFS server port")
-    flag.StringVar(&opts.LogDir, "log-dir", "logs", "Log directory")
-    
     flag.Parse()
-    
-    return opts
-}
-
-func validateOptions(opts *CommandLineOptions) error {
-    if opts.NodeID == "" {
-        return errors.New("node ID is required")
-    }
-    if opts.Role == "" {
-        return errors.New("role is required")
-    }
-    if opts.Role == "leader" {
-        if opts.SourceFile == "" {
-            return errors.New("source file is required for leader")
-        }
-        if opts.DestFile == "" {
-            return errors.New("destination file is required for leader")
-        }
-        if opts.NumTasks < 1 {
-            return errors.New("number of tasks must be positive")
-        }
-    }
-    return nil
-}
-
-func createWorkDirs(opts *CommandLineOptions) error {
-    dirs := []string{
-        opts.LogDir,
-        "states",
-        "logs",
-        filepath.Join("states", opts.NodeID),
-        filepath.Join("logs", opts.NodeID),
+    if *nodeID == "" || *role == "" {
+        log.Fatal("Missing required flags: -id, -role")
     }
 
-    for _, dir := range dirs {
-        if err := os.MkdirAll(dir, 0755); err != nil {
-            return fmt.Errorf("failed to create directory %s: %v", dir, err)
-        }
-    }
-    return nil
-}
-
-func runLeader(opts *CommandLineOptions) error {
-    // 创建leader配置
     config := WorkerConfig{
-        ID:         opts.NodeID,
-        Role:       opts.Role,
-        Addr:       opts.Addr,
-        Port:       opts.Port,
-        BatchSize:  DefaultBatchSize,
-        ParamX:     opts.ParamX,
-        HydfsAddr:  opts.HydfsAddr,
-        HydfsPort:  opts.HydfsPort,
-        LogDir:     opts.LogDir,
+        ID: *nodeID,
+        Role: *role,
+        Addr: *addr,
+        Port: *port,
+        ParamX: *paramX,
+        HydfsAddr: *hydfsAddr,
+        HydfsPort: *hydfsPort,
+        LogDir: *logDir,
+        SrcFile: *srcFile,
+        DestFile: *destFile,
+        NumTasks: *numTasks,
+        ClusterFile: *clusterFile,
     }
 
-    // 创建并启动leader
-    leader, err := NewWorker(config)
-    if err != nil {
-        return err
+    if *role == RoleLeader {
+        leader, err := NewLeader(config)
+        if err != nil {
+            log.Fatal(err)
+        }
+        if err := leader.Start(); err != nil {
+            log.Fatal(err)
+        }
+        waitSignal(leader.StopChan)
+    } else if *role == RoleWorker {
+        worker, err := NewWorker(config)
+        if err != nil {
+            log.Fatal(err)
+        }
+        if err := worker.Start(); err != nil {
+            log.Fatal(err)
+        }
+        waitSignal(worker.StopChan)
+    } else {
+        log.Fatalf("Unknown role: %s", *role)
     }
-
-    // 设置信号处理
-    setupSignalHandler(leader)
-
-    // 启动leader
-    if err := leader.Start(); err != nil {
-        return err
-    }
-
-    // 等待退出信号
-    <-leader.StopChan
-    return nil
 }
 
-func runWorker(opts *CommandLineOptions) error {
-    config := WorkerConfig{
-        ID:         opts.NodeID,
-        Role:       opts.Role,
-        Addr:       opts.Addr,
-        Port:       opts.Port,
-        BatchSize:  DefaultBatchSize,
-        ParamX:     opts.ParamX,
-        HydfsAddr:  opts.HydfsAddr,
-        HydfsPort:  opts.HydfsPort,
-        LogDir:     opts.LogDir,
-    }
-
-    worker, err := NewWorker(config)
-    if err != nil {
-        return err
-    }
-
-    // 设置信号处理
-    setupSignalHandler(worker)
-
-    // 启动worker
-    if err := worker.Start(); err != nil {
-        return err
-    }
-
-    // 等待退出信号
-    <-worker.StopChan
-    return nil
-}
-
-func setupSignalHandler(w *Worker) {
+func waitSignal(stopChan chan struct{}) {
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-    go func() {
-        sig := <-sigChan
-        w.logEvent("SHUTDOWN_INITIATED", 
-            fmt.Sprintf("Received signal %s", sig),
-            nil)
-        close(w.StopChan)
-    }()
+    select {
+    case <-sigChan:
+        close(stopChan)
+    }
 }

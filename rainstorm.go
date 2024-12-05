@@ -235,21 +235,44 @@ func (c *HydfsClient) CreateFile(path string, data []byte) error {
 }
 
 func (c *HydfsClient) AppendFile(path string, data []byte) error {
-    if err := c.connect(); err != nil {
-        return err
-    }
+    c.mutex.Lock()
+    defer c.mutex.Unlock()
 
-    req := struct {
+    addr := fmt.Sprintf("%s:%d", c.Addr, c.Port)
+    conn, err := net.DialTimeout("tcp", addr, ProcessTimeout)
+    if err != nil {
+        return fmt.Errorf("failed to connect to HyDFS: %v", err)
+    }
+    defer conn.Close()
+
+    request := struct {
         Op   string `json:"op"`
         Path string `json:"path"`
-        Data []byte `json:"data"`
+        Data string `json:"data"`  // base64编码的数据
     }{
         Op:   "APPEND",
         Path: path,
-        Data: data,
+        Data: base64.StdEncoding.EncodeToString(data),
     }
 
-    return c.sendRequest(req)
+    if err := json.NewEncoder(conn).Encode(request); err != nil {
+        return fmt.Errorf("failed to send request: %v", err)
+    }
+
+    var response struct {
+        Success bool   `json:"success"`
+        Error   string `json:"error,omitempty"`
+    }
+    
+    if err := json.NewDecoder(conn).Decode(&response); err != nil {
+        return fmt.Errorf("failed to read response: %v", err)
+    }
+
+    if !response.Success {
+        return fmt.Errorf("HyDFS operation failed: %s", response.Error)
+    }
+
+    return nil
 }
 
 func (c *HydfsClient) ReadFile(path string) ([]byte, error) {
@@ -392,6 +415,7 @@ func (w *Worker) initLogger() error {
 }
 
 func (w *Worker) Start() error {
+    // 确保必要的目录存在
     dirs := []string{
         w.Config.LogDir,
         "states",
@@ -406,18 +430,43 @@ func (w *Worker) Start() error {
         }
     }
 
+    // 启动网络监听
     if err := w.startNetwork(); err != nil {
         return err
     }
 
-    go w.processLoop()
-    go w.logLoop()
-    go w.handleConnections()
-    go w.stateSync()
+    // 启动其他服务
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                w.Logger.Printf("Recovered from panic in processLoop: %v", r)
+            }
+        }()
+        w.processLoop()
+    }()
+
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                w.Logger.Printf("Recovered from panic in logLoop: %v", r)
+            }
+        }()
+        w.logLoop()
+    }()
+
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                w.Logger.Printf("Recovered from panic in handleConnections: %v", r)
+            }
+        }()
+        w.handleConnections()
+    }()
 
     w.Logger.Printf("Worker started [Role: %s]", w.Role)
     return nil
 }
+
 
 func (w *Worker) processLoop() {
     ticker := time.NewTicker(100 * time.Millisecond)
@@ -1183,18 +1232,13 @@ func (w *Worker) logLoop() {
             return
         case entry := <-w.LogChan:
             if err := w.writeLog(entry); err != nil {
-                w.Logger.Printf("Failed to write log: %v", err)
+                w.Logger.Printf("Warning: Failed to write log: %v", err)
             }
         }
     }
 }
 
 func (w *Worker) writeLog(entry *LogEntry) error {
-    logDir := filepath.Dir(w.LogFile.Name())
-    if err := os.MkdirAll(logDir, 0755); err != nil {
-        return fmt.Errorf("failed to create log directory: %v", err)
-    }
-
     logData, err := json.Marshal(entry)
     if err != nil {
         return fmt.Errorf("failed to marshal log entry: %v", err)
@@ -1204,17 +1248,18 @@ func (w *Worker) writeLog(entry *LogEntry) error {
         return fmt.Errorf("failed to write to local log file: %v", err)
     }
 
-    if w.HydfsClient != nil {
-        logPath := fmt.Sprintf("logs/%s/%s.log", 
-            w.ID, 
-            time.Now().Format("2006-01-02"))
-        
-        logData = append(logData, '\n')
-        
-        if err := w.HydfsClient.AppendFile(logPath, logData); err != nil {
-            return fmt.Errorf("failed to write to HyDFS: %v", err)
-        }
+    if w.HydfsClient == nil {
+        return nil
     }
+
+    logDir := fmt.Sprintf("logs/%s", w.ID)
+    logPath := filepath.Join(logDir, time.Now().Format("2006-01-02")+".log")
+
+    if err := w.HydfsClient.AppendFile(logPath, append(logData, '\n')); err != nil {
+        w.Logger.Printf("Warning: Failed to write log to HyDFS: %v", err)
+        return nil  
+    }
+
     return nil
 }
 

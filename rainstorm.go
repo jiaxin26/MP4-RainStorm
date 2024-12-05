@@ -4,6 +4,7 @@ import (
     "bytes"
     "hash/fnv"
     "crypto/sha256"
+    "encoding/base64"
     "encoding/csv"
     "encoding/json"
     "errors"

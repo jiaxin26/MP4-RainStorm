@@ -1257,7 +1257,7 @@ func (w *Worker) writeLog(entry *LogEntry) error {
     logPath := filepath.Join(logDir, time.Now().Format("2006-01-02")+".log")
 
     if err := w.HydfsClient.AppendFile(logPath, append(logData, '\n')); err != nil {
-        w.Logger.Printf("Warning: Failed to write log to HyDFS: %v", err)
+        // w.Logger.Printf("Warning: Failed to write log to HyDFS: %v", err)
         return nil  
     }
 

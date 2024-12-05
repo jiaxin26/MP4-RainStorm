@@ -126,13 +126,12 @@ type State struct {
     LastBatchID     string                `json:"last_batch_id"`
 }
 
-// LogEntry 定义
 type LogEntry struct {
-    Timestamp time.Time    `json:"timestamp"`
-    Level     string       `json:"level"`
-    Type      string       `json:"type"`
-    Message   string       `json:"message"`
-    Data      interface{}  `json:"data,omitempty"`
+    Timestamp time.Time         `json:"timestamp"`
+    Level     string           `json:"level"`
+    Type      string           `json:"type"`
+    Message   string           `json:"message"`
+    Data      json.RawMessage  `json:"data,omitempty"`  
 }
 
 // Worker 配置
@@ -374,12 +373,10 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 }
 
 func (w *Worker) initLogger() error {
-    // 创建日志目录
     if err := os.MkdirAll(w.Config.LogDir, 0755); err != nil {
         return fmt.Errorf("failed to create log directory: %v", err)
     }
 
-    // 打开日志文件
     logFile := filepath.Join(w.Config.LogDir, fmt.Sprintf("%s.log", w.ID))
     file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
     if err != nil {
@@ -387,7 +384,6 @@ func (w *Worker) initLogger() error {
     }
     w.LogFile = file
 
-    // 设置日志
     w.Logger = log.New(io.MultiWriter(os.Stdout, file), 
         fmt.Sprintf("[%s] ", w.ID), 
         log.LstdFlags|log.Lmicroseconds)
@@ -395,14 +391,25 @@ func (w *Worker) initLogger() error {
     return nil
 }
 
-// Worker 核心处理逻辑
 func (w *Worker) Start() error {
-    // 启动网络监听
+    dirs := []string{
+        w.Config.LogDir,
+        "states",
+        "logs",
+        filepath.Join("states", w.ID),
+        filepath.Join("logs", w.ID),
+    }
+
+    for _, dir := range dirs {
+        if err := os.MkdirAll(dir, 0755); err != nil {
+            return fmt.Errorf("failed to create directory %s: %v", dir, err)
+        }
+    }
+
     if err := w.startNetwork(); err != nil {
         return err
     }
 
-    // 启动处理goroutines
     go w.processLoop()
     go w.logLoop()
     go w.handleConnections()
@@ -1183,32 +1190,52 @@ func (w *Worker) logLoop() {
 }
 
 func (w *Worker) writeLog(entry *LogEntry) error {
-    // 写入本地日志文件
-    logLine, err := json.Marshal(entry)
+    logDir := filepath.Dir(w.LogFile.Name())
+    if err := os.MkdirAll(logDir, 0755); err != nil {
+        return fmt.Errorf("failed to create log directory: %v", err)
+    }
+
+    logData, err := json.Marshal(entry)
     if err != nil {
-        return err
+        return fmt.Errorf("failed to marshal log entry: %v", err)
     }
 
-    if _, err := fmt.Fprintln(w.LogFile, string(logLine)); err != nil {
-        return err
+    if _, err := fmt.Fprintln(w.LogFile, string(logData)); err != nil {
+        return fmt.Errorf("failed to write to local log file: %v", err)
     }
 
-    // 同时写入HyDFS
-    logPath := fmt.Sprintf("logs/%s/%s.log", w.ID, time.Now().Format("2006-01-02"))
-    return w.HydfsClient.AppendFile(logPath, append(logLine, '\n'))
+    if w.HydfsClient != nil {
+        logPath := fmt.Sprintf("logs/%s/%s.log", 
+            w.ID, 
+            time.Now().Format("2006-01-02"))
+        
+        logData = append(logData, '\n')
+        
+        if err := w.HydfsClient.AppendFile(logPath, logData); err != nil {
+            return fmt.Errorf("failed to write to HyDFS: %v", err)
+        }
+    }
+    return nil
 }
 
 func (w *Worker) logEvent(eventType, message string, data interface{}) {
-    select {
-    case w.LogChan <- &LogEntry{
+    var jsonData json.RawMessage
+    if data != nil {
+        if rawData, err := json.Marshal(data); err == nil {
+            jsonData = rawData
+        }
+    }
+    entry := &LogEntry{
         Timestamp: time.Now(),
         Level:     "INFO",
         Type:      eventType,
         Message:   message,
-        Data:      data,
-    }:
+        Data:      jsonData,
+    }
+    select {
+    case w.LogChan <- entry:
     default:
-        w.Logger.Printf("Warning: Log channel full, dropped event: %s", eventType)
+        w.Logger.Printf("[%s] %s: %s", eventType, message, string(jsonData))
     }
 }
 

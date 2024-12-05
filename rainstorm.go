@@ -890,6 +890,18 @@ func (w *Worker) persistState() error {
     return nil
 }
 
+func (c *HydfsClient) ensureDirectory(path string) error {
+    req := struct {
+        Op   string `json:"op"`
+        Path string `json:"path"`
+    }{
+        Op:   "MKDIR",
+        Path: path,
+    }
+    
+    return c.sendRequest(req)
+}
+
 func (w *Worker) recoverState() error {
     // 获取最新的状态文件
     stateFiles, err := w.HydfsClient.ListFiles("states/" + w.ID)
@@ -1029,6 +1041,94 @@ func (w *Worker) handlePeerFailure(failedID string) {
         nil)
 }
 
+func (w *Worker) reassignTasks(failedID string) error {
+    // 获取活跃节点列表
+    activeNodes := make([]string, 0)
+    w.memberMutex.RLock()
+    for id, member := range w.members {
+        if id != failedID && member.Status == StatusNormal {
+            activeNodes = append(activeNodes, id)
+        }
+    }
+    w.memberMutex.RUnlock()
+
+    if len(activeNodes) == 0 {
+        return errors.New("no active nodes available for task reassignment")
+    }
+
+    // 通知其他节点重新分配任务
+    msg := Message{
+        Type:      "TASK_REASSIGN",
+        SenderID:  w.ID,
+        Timestamp: time.Now(),
+        Data: map[string]interface{}{
+            "failed_node": failedID,
+        },
+    }
+
+    for _, nodeID := range activeNodes {
+        if err := w.sendMessage(nodeID, msg); err != nil {
+            w.logError("task_reassignment_failed", 
+                fmt.Errorf("failed to notify %s: %v", nodeID, err))
+        }
+    }
+
+    return nil
+}
+
+
+func (w *Worker) redistributeState(failedID string) error {
+    w.StateMutex.Lock()
+    defer w.StateMutex.Unlock()
+
+    // 获取活跃节点列表
+    activeNodes := make([]string, 0)
+    w.memberMutex.RLock()
+    for id, member := range w.members {
+        if id != failedID && member.Status == StatusNormal {
+            activeNodes = append(activeNodes, id)
+        }
+    }
+    w.memberMutex.RUnlock()
+
+    if len(activeNodes) == 0 {
+        return errors.New("no active nodes available for state redistribution")
+    }
+
+    // 重新分配状态
+    for category, count := range w.State.AggregateState {
+        // 使用一致性哈希或简单的取模来决定新的负责节点
+        targetNode := activeNodes[int(hashString(category))%len(activeNodes)]
+        if targetNode == w.ID {
+            continue // 已经在当前节点上
+        }
+
+        // 发送状态更新消息给目标节点
+        msg := Message{
+            Type:      MsgStateSync,
+            SenderID:  w.ID,
+            Timestamp: time.Now(),
+            Data: map[string]interface{}{
+                "category": category,
+                "count":    count,
+            },
+        }
+
+        if err := w.sendMessage(targetNode, msg); err != nil {
+            return fmt.Errorf("failed to redistribute state to %s: %v", targetNode, err)
+        }
+    }
+
+    return nil
+}
+
+func hashString(s string) uint32 {
+    h := fnv.New32a()
+    h.Write([]byte(s))
+    return h.Sum32()
+}
+
+
 // 日志记录实现
 func (w *Worker) logLoop() {
     for {
@@ -1112,6 +1212,26 @@ func main() {
     default:
         log.Fatalf("Unknown role: %s", options.Role)
     }
+}
+
+func parseCommandLine() *CommandLineOptions {
+    opts := &CommandLineOptions{}
+    
+    flag.StringVar(&opts.NodeID, "id", "", "Node ID")
+    flag.StringVar(&opts.Role, "role", "", "Node role (leader/worker)")
+    flag.StringVar(&opts.Addr, "addr", "localhost", "Listen address")
+    flag.IntVar(&opts.Port, "port", BasePort, "Listen port")
+    flag.StringVar(&opts.SourceFile, "src", "", "Source file path")
+    flag.StringVar(&opts.DestFile, "dest", "", "Destination file path")
+    flag.IntVar(&opts.NumTasks, "tasks", 3, "Number of tasks")
+    flag.StringVar(&opts.ParamX, "param-x", "", "Parameter X value")
+    flag.StringVar(&opts.HydfsAddr, "hydfs-addr", "localhost", "HyDFS server address")
+    flag.IntVar(&opts.HydfsPort, "hydfs-port", FileServerPort, "HyDFS server port")
+    flag.StringVar(&opts.LogDir, "log-dir", "logs", "Log directory")
+    
+    flag.Parse()
+    
+    return opts
 }
 
 func validateOptions(opts *CommandLineOptions) error {

@@ -631,7 +631,7 @@ func (w *Worker) handleTransformTuple(tuple *Tuple) ([]*Tuple, error) {
         return nil, fmt.Errorf("insufficient fields in CSV")
     }
 
-    objectID := fields[0]
+    objectID := fields[2]
     signType := fields[3]
 
     // 创建结果tuple

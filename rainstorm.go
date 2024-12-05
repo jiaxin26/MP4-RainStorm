@@ -823,6 +823,7 @@ func (w *Worker) handleConnections() {
 
 func (w *Worker) handleConnection(conn net.Conn) {
     defer conn.Close()
+
     conn.SetDeadline(time.Now().Add(ProcessTimeout))
 
     decoder := json.NewDecoder(conn)
@@ -840,13 +841,17 @@ func (w *Worker) handleConnection(conn net.Conn) {
     }
 }
 
-func (w *Worker) processMessage(msg Message) {
+func (w *Worker) processMessage(msg Message) Message {  // 明确指定返回类型为Message
     w.logEvent("MESSAGE_RECEIVED", 
         fmt.Sprintf("Received message type %s from %s", msg.Type, msg.SenderID),
         nil)
 
-    var err error
+    var response Message
+    response.Type = MsgAck
+    response.SenderID = w.ID
+    response.Timestamp = time.Now()
 
+    var err error
     switch msg.Type {
     case MsgTuple:
         err = w.handleTupleMessage(msg)
@@ -861,8 +866,15 @@ func (w *Worker) processMessage(msg Message) {
     }
 
     if err != nil {
-        w.logError("message_processing_failed", err)
+        return Message{
+            Type:      MsgError,
+            SenderID:  w.ID,
+            Timestamp: time.Now(),
+            Data:      err.Error(),
+        }
     }
+
+    return response
 }
 
 // 状态同步和故障恢复实现

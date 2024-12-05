@@ -37,6 +37,20 @@ const (
     LogBufferSize     = 1000
 )
 
+type CommandLineOptions struct {
+    NodeID      string
+    Role        string
+    Addr        string
+    Port        int
+    SourceFile  string
+    DestFile    string
+    NumTasks    int
+    ParamX      string
+    HydfsAddr   string
+    HydfsPort   int
+    LogDir      string
+}
+
 // 错误定义
 var (
     ErrFileNotFound     = errors.New("file not found")
@@ -290,7 +304,10 @@ func (c *HydfsClient) ListFiles(prefix string) ([]string, error) {
 
 func (c *HydfsClient) sendRequest(req interface{}) error {
     resp, err := c.sendRequestWithResponse(req)
-    return err
+    if err != nil {
+        return err
+    }
+    return nil
 }
 
 func (c *HydfsClient) sendRequestWithResponse(req interface{}) (*struct {
@@ -453,6 +470,90 @@ func (w *Worker) processTuple(tuple *Tuple) error {
 
     // 将结果加入批次
     return w.addToBatch(result)
+}
+
+func (w *Worker) handleTupleMessage(msg Message) error {
+    tuple, ok := msg.Data.(*Tuple)
+    if !ok {
+        return fmt.Errorf("invalid tuple data format")
+    }
+
+    select {
+    case w.InputChan <- tuple:
+        return nil
+    case <-time.After(ProcessTimeout):
+        return ErrTimeout
+    }
+}
+
+func (w *Worker) handleBatchMessage(msg Message) error {
+    batch, ok := msg.Data.(*Batch)
+    if !ok {
+        return fmt.Errorf("invalid batch data format")
+    }
+
+    // 验证批次校验和
+    batchData, err := json.Marshal(batch.Tuples)
+    if err != nil {
+        return err
+    }
+
+    if !bytes.Equal(calculateChecksum(batchData), batch.Checksum) {
+        return fmt.Errorf("batch checksum mismatch")
+    }
+
+    for _, tuple := range batch.Tuples {
+        if err := w.processTuple(tuple); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+
+func (w *Worker) handleStateSyncMessage(msg Message) error {
+    var state State
+    data, err := json.Marshal(msg.Data)
+    if err != nil {
+        return err
+    }
+
+    if err := json.Unmarshal(data, &state); err != nil {
+        return err
+    }
+
+    // 合并状态
+    w.StateMutex.Lock()
+    defer w.StateMutex.Unlock()
+
+    // 更新状态
+    for id := range state.ProcessedTuples {
+        w.State.ProcessedTuples[id] = true
+    }
+
+    if w.Role == "aggregate" {
+        for k, v := range state.AggregateState {
+            if current, exists := w.State.AggregateState[k]; exists {
+                w.State.AggregateState[k] = current.(int) + v.(int)
+            } else {
+                w.State.AggregateState[k] = v
+            }
+        }
+    }
+
+    return nil
+}
+
+func (w *Worker) handleHeartbeatMessage(msg Message) error {
+    w.memberMutex.Lock()
+    defer w.memberMutex.Unlock()
+
+    if member, exists := w.members[msg.SenderID]; exists {
+        member.LastHeartbeat = msg.Timestamp
+        member.Status = StatusNormal
+    }
+
+    return nil
 }
 
 func (w *Worker) handleSourceTuple(tuple *Tuple) ([]*Tuple, error) {
@@ -709,12 +810,11 @@ func (w *Worker) handleConnection(conn net.Conn) {
     }
 }
 
-func (w *Worker) processMessage(msg Message) Message {
+func (w *Worker) processMessage(msg Message) {
     w.logEvent("MESSAGE_RECEIVED", 
         fmt.Sprintf("Received message type %s from %s", msg.Type, msg.SenderID),
         nil)
 
-    var response Message
     var err error
 
     switch msg.Type {
@@ -731,18 +831,7 @@ func (w *Worker) processMessage(msg Message) Message {
     }
 
     if err != nil {
-        return Message{
-            Type:      MsgError,
-            SenderID:  w.ID,
-            Timestamp: time.Now(),
-            Data:      err.Error(),
-        }
-    }
-
-    return Message{
-        Type:      MsgAck,
-        SenderID:  w.ID,
-        Timestamp: time.Now(),
+        w.logError("message_processing_failed", err)
     }
 }
 

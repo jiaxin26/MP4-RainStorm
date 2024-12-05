@@ -3,6 +3,7 @@ package main
 import (
     "bufio"
     "bytes"
+    "hash/fnv"
     "crypto/sha256"
     "encoding/csv"
     "encoding/json"
@@ -544,6 +545,40 @@ func (w *Worker) handleStateSyncMessage(msg Message) error {
     return nil
 }
 
+func (w *Worker) sendMessage(targetID string, msg Message) error {
+    w.memberMutex.RLock()
+    target, exists := w.members[targetID]
+    w.memberMutex.RUnlock()
+
+    if !exists {
+        return ErrNodeNotFound
+    }
+
+    addr := fmt.Sprintf("%s:%d", target.Address, target.Port)
+    conn, err := net.DialTimeout("tcp", addr, ProcessTimeout)
+    if err != nil {
+        return fmt.Errorf("failed to connect to %s: %v", targetID, err)
+    }
+    defer conn.Close()
+
+    encoder := json.NewEncoder(conn)
+    if err := encoder.Encode(msg); err != nil {
+        return fmt.Errorf("failed to send message: %v", err)
+    }
+
+    decoder := json.NewDecoder(conn)
+    var response Message
+    if err := decoder.Decode(&response); err != nil {
+        return fmt.Errorf("failed to read response: %v", err)
+    }
+
+    if response.Type == MsgError {
+        return fmt.Errorf("remote error: %v", response.Data)
+    }
+
+    return nil
+}
+
 func (w *Worker) handleHeartbeatMessage(msg Message) error {
     w.memberMutex.Lock()
     defer w.memberMutex.Unlock()
@@ -788,11 +823,8 @@ func (w *Worker) handleConnections() {
 
 func (w *Worker) handleConnection(conn net.Conn) {
     defer conn.Close()
-
-    // 设置连接超时
     conn.SetDeadline(time.Now().Add(ProcessTimeout))
 
-    // 解码消息
     decoder := json.NewDecoder(conn)
     var msg Message
     if err := decoder.Decode(&msg); err != nil {
@@ -800,10 +832,8 @@ func (w *Worker) handleConnection(conn net.Conn) {
         return
     }
 
-    // 处理消息
-    response := w.processMessage(msg)
+    response := w.processMessage(msg)  
 
-    // 发送响应
     encoder := json.NewEncoder(conn)
     if err := encoder.Encode(response); err != nil {
         w.logError("encode_error", err)

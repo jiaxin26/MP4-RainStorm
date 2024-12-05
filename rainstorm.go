@@ -221,6 +221,94 @@ func (c *HydfsClient) sendRequest(op string, path string, data []byte) (bool, []
     return true, decoded, "", nil
 }
 
+func (l *Leader) loadClusterConfig(path string) error {
+    file, err := os.Open(path)
+    if err != nil {
+        return fmt.Errorf("failed to open cluster config: %v", err)
+    }
+    defer file.Close()
+
+    scanner := bufio.NewScanner(file)
+    for scanner.Scan() {
+        line := scanner.Text()
+        fields := strings.Fields(line)
+        // 假设格式：nodeID role stage hostname port
+        if len(fields) < 5 {
+            continue
+        }
+
+        nodeID := fields[0]
+        role := fields[1]
+        stage := fields[2]
+        host := fields[3]
+        p, err := strconv.Atoi(fields[4])
+        if err != nil {
+            return fmt.Errorf("invalid port number in cluster config line: %s", line)
+        }
+
+        // 仅在Leader中初始化所有节点信息
+        // 对于Leader自身，也在此更新/确认自己的信息
+        l.MemberMutex.Lock()
+        l.Members[nodeID] = &MemberInfo{
+            ID:            nodeID,
+            Address:       host,
+            Port:          p,
+            Status:        StatusNormal,
+            LastHeartbeat: time.Now(),
+            Stage:         stage,
+        }
+        l.MemberMutex.Unlock()
+    }
+
+    if err := scanner.Err(); err != nil {
+        return fmt.Errorf("error reading cluster config: %v", err)
+    }
+
+    return nil
+}
+
+func (w *Worker) loadClusterConfig(path string) error {
+    file, err := os.Open(path)
+    if err != nil {
+        return fmt.Errorf("failed to open cluster config: %v", err)
+    }
+    defer file.Close()
+
+    scanner := bufio.NewScanner(file)
+    for scanner.Scan() {
+        line := scanner.Text()
+        fields := strings.Fields(line)
+        if len(fields) < 5 {
+            continue
+        }
+        nodeID := fields[0]
+        role := fields[1]
+        stage := fields[2]
+        host := fields[3]
+        p, err := strconv.Atoi(fields[4])
+        if err != nil {
+            return fmt.Errorf("invalid port number in cluster config line: %s", line)
+        }
+
+        w.MemberMutex.Lock()
+        w.Members[nodeID] = &MemberInfo{
+            ID: nodeID,
+            Address: host,
+            Port: p,
+            Status: StatusNormal,
+            LastHeartbeat: time.Now(),
+            Stage: stage,
+        }
+        w.MemberMutex.Unlock()
+    }
+
+    if err := scanner.Err(); err != nil {
+        return fmt.Errorf("error reading cluster config: %v", err)
+    }
+    return nil
+}
+
+
 func (c *HydfsClient) CreateFile(path string, data []byte) error {
     success, _, errMsg, err := c.sendRequest("CREATE", path, data)
     if err != nil {
@@ -335,19 +423,70 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
     return w, nil
 }
 
+func (w *Worker) sourceReaderLoop() {
+
+    for {
+        select {
+        case <-w.StopChan:
+            return
+        default:
+            data, err := w.HydfsClient.ReadFile(w.Config.SrcFile)
+            if err != nil {
+                // 如果读取失败，等待一段时间重试
+                log.Printf("[%s] Failed to read source file %s from HyDFS: %v",
+                    w.Config.ID, w.Config.SrcFile, err)
+                time.Sleep(2 * time.Second)
+                continue
+            }
+
+            lines := bytes.Split(data, []byte("\n"))
+            for i, line := range lines {
+                // 去掉空行
+                strLine := strings.TrimSpace(string(line))
+                if strLine == "" {
+                    continue
+                }
+
+                // 为每一行创建一个tuple，并放入InputChan
+                tupleID := fmt.Sprintf("%s-line-%d", w.Config.ID, i)
+                t := &Tuple{
+                    ID: tupleID,
+                    Key: fmt.Sprintf("%s:%d", w.Config.SrcFile, i),
+                    Value: strLine,
+                    Timestamp: time.Now(),
+                    Source: w.Config.ID,
+                }
+
+                select {
+                case w.InputChan <- t:
+                    // 正常发送
+                case <-w.StopChan:
+                    return
+                }
+
+                // 控制发送速率，避免太快
+                time.Sleep(10 * time.Millisecond)
+            }
+            break
+        }
+    }
+}
+
 func (w *Worker) Start() error {
-    // 恢复状态
     if err := w.recoverState(); err != nil {
         log.Printf("[%s] Failed to recover state: %v\n", w.Config.ID, err)
     }
 
-    // 启动网络监听
     addr := fmt.Sprintf("%s:%d", w.Config.Addr, w.Config.Port)
     ln, err := net.Listen("tcp", addr)
     if err != nil {
         return err
     }
     w.Listener = ln
+
+    if w.Config.Stage == StageSource && w.Config.SrcFile != "" {
+        go w.sourceReaderLoop()
+    }
 
     go w.acceptLoop()
     go w.processLoop()

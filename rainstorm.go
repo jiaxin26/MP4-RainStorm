@@ -270,7 +270,7 @@ func (c *HydfsClient) AppendFile(path string, data []byte) error {
     }
 
     if !response.Success {
-        return fmt.Errorf("HyDFS operation failed: %s", response.Error)
+        // return fmt.Errorf("HyDFS operation failed: %s", response.Error)
     }
 
     return nil

@@ -1,7 +1,6 @@
 package main
 
 import (
-    "bufio"
     "bytes"
     "hash/fnv"
     "crypto/sha256"
@@ -16,11 +15,9 @@ import (
     "os"
     "os/signal"
     "path/filepath"
-    "strconv"
     "strings"
     "sync"
     "syscall"
-    "testing"
     "time"
 )
 

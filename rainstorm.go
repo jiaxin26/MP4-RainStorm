@@ -301,7 +301,7 @@ func (c *HydfsClient) ListFiles(prefix string) ([]string, error) {
 }
 
 func (c *HydfsClient) sendRequest(req interface{}) error {
-    resp, err := c.sendRequestWithResponse(req)
+    _, err := c.sendRequestWithResponse(req)
     if err != nil {
         return err
     }

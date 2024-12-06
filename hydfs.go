@@ -89,10 +89,10 @@ const (
 
 
 // 操作类型
-type OperationType int
+type OperatorType int
 
 const (
-    OpNone OperationType = iota
+    OpNone OperatorType = iota
     OpCreate
     OpAppend
     OpDelete
@@ -134,7 +134,7 @@ const (
 
 // Operation 操作记录
 type Operation struct {
-    Type      OperationType `json:"type"`
+    Type      OperatorType `json:"type"`
     ClientID  string        `json:"client_id"`
     Filename  string        `json:"filename"`
     Timestamp time.Time     `json:"timestamp"`
@@ -147,7 +147,7 @@ type Operation struct {
 
 func (op *Operation) UnmarshalJSON(data []byte) error {
     var aux struct {
-        Type      OperationType `json:"type"`
+        Type      OperatorType `json:"type"`
         ClientID  string        `json:"client_id"`
         Filename  string        `json:"filename"`
         Timestamp string        `json:"timestamp"`
@@ -3893,6 +3893,39 @@ func handleRainStorm(n *Node, args []string) {
     }
 }
 
+func initHydfs(nodeID, address string, port int, isIntroducer bool) (*Node, error) {
+    // 设置日志
+    logFile := setupLogging(nodeID)
+    defer logFile.Close()
+
+    // 创建节点
+    node, err := NewNode(nodeID, address, port)
+    if err != nil {
+        return nil, fmt.Errorf("Failed to create node: %v", err)
+    }
+
+    // 设置信号处理
+    setupSignalHandler(node)
+
+    // 启动节点
+    if err := node.Start(); err != nil {
+        return nil, fmt.Errorf("Failed to start node: %v", err)
+    }
+
+    // 处理引导节点和加入集群
+    if isIntroducer {
+        if err := node.StartIntroducer(); err != nil {
+            return nil, fmt.Errorf("Failed to start introducer: %v", err)
+        }
+    } else {
+        if err := node.JoinCluster(); err != nil {
+            return nil, fmt.Errorf("Failed to join cluster: %v", err)
+        }
+    }
+
+    return node, nil
+}
+
 
 func handleCommands(n *Node) {
     scanner := bufio.NewScanner(os.Stdin)
@@ -3971,10 +4004,6 @@ func handleCommands(n *Node) {
         case "leave":
             handleLeave(n)
             return
-
-        case "measure":
-            fmt.Println("Starting measurements... This may take a while...")
-            RunAllMeasurements(n)
 
         case "rainstorm":
             handleRainStorm(n, args)

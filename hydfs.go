@@ -404,69 +404,6 @@ func (n *Node) StartIntroducer() error {
     return nil
 }
 
-
-// func (n *Node) JoinCluster() error {
-//     // 使用硬编码的默认introducer地址和端口
-//     introducerAddr := "fa24-cs425-8101.cs.illinois.edu:9001"
-    
-//     // 如果环境变量设置了，则使用环境变量中的地址和端口
-//     if host := os.Getenv("INTRODUCER_HOST"); host != "" {
-//         if port := os.Getenv("INTRODUCER_PORT"); port != "" {
-//             introducerAddr = fmt.Sprintf("%s:%s", host, port)
-//         }
-//     }
-
-//     n.logger.Printf("Attempting to join cluster via introducer at %s", introducerAddr)
-    
-//     conn, err := net.DialTimeout("tcp", introducerAddr, ConnectTimeout)
-//     if err != nil {
-//         return fmt.Errorf("failed to connect to introducer: %v", err)
-//     }
-//     defer conn.Close()
-
-//     // 发送加入请求
-//     joinMsg := Message{
-//         Type:      "JOIN",
-//         SenderID:  n.ID,
-//         Timestamp: time.Now(),
-//         Data: map[string]interface{}{
-//             "address": n.Address,
-//             "port":    n.Port,
-//         },
-//     }
-
-//     encoder := json.NewEncoder(conn)
-//     if err := encoder.Encode(joinMsg); err != nil {
-//         return fmt.Errorf("failed to send join request: %v", err)
-//     }
-
-//     // 等待响应
-//     decoder := json.NewDecoder(conn)
-//     var response Message
-//     if err := decoder.Decode(&response); err != nil {
-//         return fmt.Errorf("failed to receive join response: %v", err)
-//     }
-
-//     if response.Type == "ERROR" {
-//         return fmt.Errorf("join request rejected: %v", response.Data)
-//     }
-
-//     // 更新成员列表
-//     if memberList, ok := response.Data.(map[string]*MemberInfo); ok {
-//         n.memberMutex.Lock()
-//         for id, info := range memberList {
-//             if id != n.ID {
-//                 n.Members[id] = info
-//                 n.Ring.AddNode(id)
-//             }
-//         }
-//         n.memberMutex.Unlock()
-//     }
-
-//     n.logger.Printf("Successfully joined the cluster")
-//     return nil
-// }
-
 func (n *Node) JoinCluster() error {
     introducerAddr := "fa24-cs425-8101.cs.illinois.edu:9001"
     

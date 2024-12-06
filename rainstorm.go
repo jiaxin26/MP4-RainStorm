@@ -87,6 +87,7 @@ type Task struct {
     StateData    map[string]int64  `json:"state_data"`
     StartTime    time.Time         `json:"start_time"`
     LastUpdate   time.Time         `json:"last_update"`
+    ColMap       map[string]int     `json:"-"`
     mutex        sync.RWMutex
 }
 
@@ -531,9 +532,9 @@ func (w *Worker) executeTask(task *Task) {
     var results []Record
     switch task.Type {
     case OpTransform:
-        results, err = w.processFilterTask(task, records, colMap)
+        results, err = w.processFilterTask(task, records)
     case OpAggregateByKey:
-        results, err = w.processCountTask(task, records, colMap)
+        results, err = w.processCountTask(task, records)
     }
 
     if err != nil {
@@ -614,8 +615,9 @@ func (w *Worker) readInput(task *Task) ([]Record, error) {
 }
 
 
-func (w *Worker) processFilterTask(task *Task, records []Record, colMap map[string]int) ([]Record, error) {
+func (w *Worker) processFilterTask(task *Task, records []Record) ([]Record, error) {
     var results []Record
+    colMap := task.ColMap
 
     objectIDIndex, ok1 := colMap["OBJECTID"]
     signTypeIndex, ok2 := colMap["Sign_Type"]
@@ -654,8 +656,8 @@ func (w *Worker) processFilterTask(task *Task, records []Record, colMap map[stri
     return results, nil
 }
 
-func (w *Worker) processCountTask(task *Task, records []Record, colMap map[string]int) ([]Record, error) {
-    // 获取所需列的索引
+func (w *Worker) processCountTask(task *Task, records []Record) ([]Record, error) {
+    colMap := task.ColMap
     signPostIndex, ok1 := colMap["Sign_Post"]
     categoryIndex, ok2 := colMap["Category"]
     if !ok1 || !ok2 {

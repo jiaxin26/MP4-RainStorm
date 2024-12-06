@@ -3836,9 +3836,11 @@ func handleRainStorm(n *Node, args []string) {
         log.Printf("Leader starting with %d tasks to be assigned", numTasks)
         log.Printf("HyDFS port: %d, Leader port: %d", n.Port, LeaderPort)
         
-        if err := leader.Start(); err != nil {
-            log.Fatalf("Leader failed: %v", err)
-        }
+        go func() {
+            if err := leader.Start(); err != nil {
+                log.Fatalf("Leader failed: %v", err)
+            }
+        }()
 
     case "worker":
         // 从本地的node信息中获取host地址
@@ -3856,9 +3858,11 @@ func handleRainStorm(n *Node, args []string) {
         log.Printf("Worker starting. HyDFS port: %d, RainStorm port: %d",
             n.Port, workerPort)
 
-        if err := worker.Start(); err != nil {
-            log.Fatalf("Worker failed: %v", err)
-        }
+        go func() {
+            if err := worker.Start(); err != nil {
+                log.Fatalf("Worker failed: %v", err)
+            }
+        }()
 
     default:
         log.Fatalf("Unknown role: %s", role)

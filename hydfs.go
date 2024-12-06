@@ -841,9 +841,6 @@ func (w *Worker) readInput(task *Task) ([]Record, error) {
 func (w *Worker) processFilterTask(task *Task, records []Record) ([]Record, error) {
     var results []Record
     colMap := task.ColMap
-    log.Printf("records::::::::::: %s", records)
-    log.Printf("task.Pattern::::::::::: %s", task.Pattern)
-
 
     objectIDIndex, ok1 := colMap["OBJECTID"]
     signTypeIndex, ok2 := colMap["Sign_Type"]
@@ -852,12 +849,11 @@ func (w *Worker) processFilterTask(task *Task, records []Record) ([]Record, erro
     }
 
     for _, record := range records {
-        log.Printf("record::::::::::: %s", record)
-
         if task.ProcessedIDs[record.UniqueID] {
             continue
         }
-
+        
+        log.Printf("record::::::::::: %s", record.Value)
         // 全行搜索pattern
         if !strings.Contains(record.Value, task.Pattern) {
             continue

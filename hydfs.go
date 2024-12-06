@@ -3834,34 +3834,48 @@ func handleRainStorm(n *Node, args []string) {
         leader.mutex.Unlock()
 
         go func() {
-            time.Sleep(5 * time.Second)
-            
-            leader.mutex.Lock()
-            // 获取所有worker
-            workers := make([]*Worker, 0, len(leader.Workers))
-            for _, w := range leader.Workers {
-                workers = append(workers, w)
-            }
-            
-            if len(workers) > 0 {
-                // 分配第一个任务
-                if err := leader.assignTaskToWorker(task1, workers[0]); err != nil {
-                    log.Printf("Failed to assign task1: %v", err)
-                }
-                
-                // 如果有第二个worker，分配第二个任务
-                if len(workers) > 1 {
-                    if err := leader.assignTaskToWorker(task2, workers[1]); err != nil {
-                        log.Printf("Failed to assign task2: %v", err)
+            for {
+                leader.mutex.RLock()
+                wcount := len(leader.Workers)
+                leader.mutex.RUnlock()
+        
+                if wcount > 0 {
+                    // 有至少一个worker时就分配第一个任务
+                    leader.mutex.Lock()
+                    workers := make([]*Worker, 0, len(leader.Workers))
+                    for _, w := range leader.Workers {
+                        workers = append(workers, w)
                     }
-                } else {
-                    // 如果只有一个worker，也分配给它
-                    if err := leader.assignTaskToWorker(task2, workers[0]); err != nil {
-                        log.Printf("Failed to assign task2: %v", err)
+        
+                    // 分配第一个任务给第一个worker
+                    if err := leader.assignTaskToWorker(task1, workers[0]); err != nil {
+                        log.Printf("Failed to assign task1: %v", err)
+                    } else {
+                        log.Printf("Task %s assigned to worker %s", task1.ID, workers[0].ID)
                     }
+        
+                    // 若有多个worker就把第二个任务给第二个worker，否则给第一个
+                    if len(workers) > 1 {
+                        if err := leader.assignTaskToWorker(task2, workers[1]); err != nil {
+                            log.Printf("Failed to assign task2: %v", err)
+                        } else {
+                            log.Printf("Task %s assigned to worker %s", task2.ID, workers[1].ID)
+                        }
+                    } else {
+                        // 只有一个worker，给它分第二个任务
+                        if err := leader.assignTaskToWorker(task2, workers[0]); err != nil {
+                            log.Printf("Failed to assign task2: %v", err)
+                        } else {
+                            log.Printf("Task %s assigned to worker %s", task2.ID, workers[0].ID)
+                        }
+                    }
+        
+                    leader.mutex.Unlock()
+                    break 
                 }
+        
+                time.Sleep(1 * time.Second)
             }
-            leader.mutex.Unlock()
         }()
 
         log.Printf("Leader starting with %d tasks to be assigned", numTasks)

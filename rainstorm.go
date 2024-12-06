@@ -20,8 +20,9 @@ import (
 
 // 系统常量
 const (
-    LeaderPort = 9001
-    WorkerBasePort = 9002
+    LeaderPort = 8000       
+    WorkerBasePort = 8001   
+    HydfsBasePort = 9001   
     MaxBatchSize = 1000
     BatchTimeout = 100 * time.Millisecond
     TaskTimeout = 5 * time.Second
@@ -783,12 +784,12 @@ func main() {
 
     var hydfsPort int
     if role == "leader" {
-        hydfsPort = 9001  
+        hydfsPort = HydfsBasePort  
     } else {
         tmpHostname := strings.TrimPrefix(hostname, "fa24-cs425-")
         tmpHostname = strings.TrimSuffix(tmpHostname, ".cs.illinois.edu")
-        nodeNum, _ := strconv.Atoi(tmpHostname[4:])  
-        hydfsPort = 9001 + (nodeNum - 8101)  // 8102->9002, 8103->9003, etc.
+        nodeNum, _ := strconv.Atoi(tmpHostname[4:])
+        hydfsPort = HydfsBasePort + (nodeNum - 8101)  
     }
 
     // 初始化HyDFS节点
@@ -828,22 +829,24 @@ func main() {
         leader.mutex.Unlock()
 
         log.Printf("Leader starting with %d tasks to be assigned", numTasks)
+        log.Printf("HyDFS port: %d, Leader port: %d", hydfsPort, LeaderPort)
         
         if err := leader.Start(); err != nil {
             log.Fatalf("Leader failed: %v", err)
         }
-
+        
     case "worker":
-        leaderAddr := "fa24-cs425-8101.cs.illinois.edu:9001"
+        leaderAddr := fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:%d", LeaderPort)  
         worker := NewWorker(
             hostname,
             hostname,
-            hydfsPort,
+            WorkerBasePort + (nodeNum - 8101),  
             hydfsNode,
             leaderAddr,
         )
         
-        log.Printf("Worker starting on port %d, connecting to leader at %s", hydfsPort, leaderAddr)
+        log.Printf("Worker starting. HyDFS port: %d, RainStorm port: %d", 
+            hydfsPort, WorkerBasePort + (nodeNum - 8101))
         
         if err := worker.Start(); err != nil {
             log.Fatalf("Worker failed: %v", err)

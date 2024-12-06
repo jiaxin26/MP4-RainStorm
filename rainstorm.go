@@ -20,7 +20,7 @@ import (
 
 // 系统常量
 const (
-    LeaderPort = 8000
+    LeaderPort = 9001
     WorkerBasePort = 8001
     MaxBatchSize = 1000
     BatchTimeout = 100 * time.Millisecond
@@ -821,12 +821,13 @@ func main() {
         }
 
     case "worker":
+        leaderAddr := fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:%d", LeaderPort)
         worker := NewWorker(
             hostname,
             hostname,
             WorkerBasePort,
             hydfsNode,
-            fmt.Sprintf("localhost:%d", LeaderPort),
+            leaderAddr, 
         )
         if err := worker.Start(); err != nil {
             log.Fatalf("Worker failed: %v", err)

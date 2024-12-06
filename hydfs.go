@@ -745,6 +745,7 @@ func (w *Worker) executeTask(task *Task) {
     // 读取和处理输入
     records, err := w.readInput(task)
     if err != nil {
+        log.Printf("1111111111111111")
         w.handleTaskError(task, err)
         return
     }
@@ -762,6 +763,7 @@ func (w *Worker) executeTask(task *Task) {
     }
 
     if err != nil {
+        log.Printf("2222222222222222")
         w.handleTaskError(task, err)
         return
     }

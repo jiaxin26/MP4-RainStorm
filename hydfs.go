@@ -933,6 +933,7 @@ func (w *Worker) writeResults(task *Task, results []Record) error {
     }
 
     // 创建临时文件
+    log.Printf("Creating tempFile......")
     tempFile := fmt.Sprintf("/tmp/%s_output", task.ID)
     if err := ioutil.WriteFile(tempFile, buffer.Bytes(), 0644); err != nil {
         return fmt.Errorf("failed to write temp file: %v", err)
@@ -940,6 +941,7 @@ func (w *Worker) writeResults(task *Task, results []Record) error {
     defer os.Remove(tempFile)
 
     // 追加到HyDFS输出文件
+    log.Printf("Writing %d records to file %s", len(results), task.OutputFile)
     return w.HyDFS.AppendFile(w.ID, tempFile, task.OutputFile)
 }
 

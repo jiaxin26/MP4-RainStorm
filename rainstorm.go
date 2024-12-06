@@ -790,10 +790,7 @@ func main() {
     } else {
         tmpHostname := strings.TrimPrefix(hostname, "fa24-cs425-")
         tmpHostname = strings.TrimSuffix(tmpHostname, ".cs.illinois.edu")
-        log.Printf("tmpHostname::::::::::: %s", tmpHostname)
-        log.Printf("tmpHostname[4:]::::::::::: %s", tmpHostname[4:])
-        nodeNum, _ := strconv.Atoi(tmpHostname[4:])
-        log.Printf("nodeNum::::::::::: %d", nodeNum)
+        nodeNum, _ := strconv.Atoi(tmpHostname)
         hydfsPort = HydfsBasePort + (nodeNum - 8101)  
     }
 

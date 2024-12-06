@@ -853,11 +853,12 @@ func (w *Worker) processFilterTask(task *Task, records []Record) ([]Record, erro
             continue
         }
         
-        log.Printf("record::::::::::: %s", record.Value)
         // 全行搜索pattern
         if !strings.Contains(record.Value, task.Pattern) {
             continue
         }
+
+        log.Printf("record::::::::::: %s", record.Value)
 
         fields := strings.Split(record.Value, ",")
         if len(fields) <= objectIDIndex || len(fields) <= signTypeIndex {

@@ -20,8 +20,8 @@ import (
 
 // 系统常量
 const (
-    LeaderPort = 8000
-    WorkerBasePort = 8001
+    LeaderPort = 9001
+    WorkerBasePort = 9002
     MaxBatchSize = 1000
     BatchTimeout = 100 * time.Millisecond
     TaskTimeout = 5 * time.Second
@@ -130,7 +130,7 @@ func NewWorker(id, address string, port int, hydfsNode *Node, leaderAddr string)
         Port:     port,
         Tasks:    make(map[string]*Task),
         HyDFS:    hydfsNode,
-        Leader:   leaderAddr,
+        Leader:   fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:9001"), 
         stopChan: make(chan struct{}),
     }
 }
@@ -768,10 +768,10 @@ func main() {
         os.Exit(1)
     }
 
-    pattern1 := os.Args[1]    // 匹配模式1
-    signPostType := os.Args[2] // Sign Post类型
-    inputFile := os.Args[3]    // 输入文件
-    outputFile := os.Args[4]   // 输出文件
+    pattern1 := os.Args[1]   
+    signPostType := os.Args[2] 
+    inputFile := os.Args[3]    
+    outputFile := os.Args[4]  
     numTasks, _ := strconv.Atoi(os.Args[5])
     role := os.Args[6]
 
@@ -781,9 +781,19 @@ func main() {
         log.Fatalf("Failed to get hostname: %v", err)
     }
 
+    var hydfsPort int
+    if role == "leader" {
+        hydfsPort = 9001  
+    } else {
+        tmpHostname := strings.TrimPrefix(hostname, "fa24-cs425-")
+        tmpHostname = strings.TrimSuffix(tmpHostname, ".cs.illinois.edu")
+        nodeNum, _ := strconv.Atoi(tmpHostname[4:])  
+        hydfsPort = 9001 + (nodeNum - 8101)  // 8102->9002, 8103->9003, etc.
+    }
+
     // 初始化HyDFS节点
     isIntroducer := role == "leader"
-    hydfsNode, err := initHydfs(hostname, hostname, DefaultHyDFSPort, isIntroducer)
+    hydfsNode, err := initHydfs(hostname, hostname, hydfsPort, isIntroducer)
     if err != nil {
         log.Fatalf("Failed to initialize HyDFS: %v", err)
     }
@@ -791,46 +801,50 @@ func main() {
     switch role {
     case "leader":
         leader := NewLeader(hydfsNode)
-        // 创建初始任务
+        
         task1 := &Task{
             ID:         "filter_task",
             Type:      OpTransform,
             Pattern:   pattern1,
             InputFiles: []string{inputFile},
             OutputFile: outputFile + "_app1",
+            ProcessedIDs: make(map[string]bool),
         }
+        
         task2 := &Task{
             ID:         "count_task",
             Type:      OpAggregateByKey,
             Pattern:   signPostType,
             InputFiles: []string{inputFile},
             OutputFile: outputFile + "_app2",
+            ProcessedIDs: make(map[string]bool),
+            StateData: make(map[string]int64),
         }
         
         // 添加任务到leader
+        leader.mutex.Lock()
         leader.Tasks[task1.ID] = task1
         leader.Tasks[task2.ID] = task2
+        leader.mutex.Unlock()
 
-        // 设置任务数量
-        for i := 0; i < numTasks; i++ {
-            // 这里可以添加任务分配逻辑
-        }
-
+        log.Printf("Leader starting with %d tasks to be assigned", numTasks)
+        
         if err := leader.Start(); err != nil {
             log.Fatalf("Leader failed: %v", err)
         }
 
     case "worker":
-        // leaderAddr := fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:%d", LeaderPort)
+        leaderAddr := "fa24-cs425-8101.cs.illinois.edu:9001"
         worker := NewWorker(
             hostname,
             hostname,
-            WorkerBasePort,
+            hydfsPort,
             hydfsNode,
-            // leaderAddr,
-            fmt.Sprintf("localhost:%d", LeaderPort),
-
+            leaderAddr,
         )
+        
+        log.Printf("Worker starting on port %d, connecting to leader at %s", hydfsPort, leaderAddr)
+        
         if err := worker.Start(); err != nil {
             log.Fatalf("Worker failed: %v", err)
         }

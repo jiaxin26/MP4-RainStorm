@@ -787,28 +787,9 @@ func (w *Worker) sendToLeader(msg Message) {
 }
 
 func main() {
-    if len(os.Args) < 7 && len(os.Args) != 4 {
+    if len(os.Args) < 7 {
         fmt.Println("Usage: rainstorm <str1> <str2> <hydfs_src_file> <hydfs_dest_file> <num_tasks> <role>")
         os.Exit(1)
-    }
-    if len(os.Args) == 4 && os.Args[1] == "put" {
-        // 获取主机名作为节点ID
-        hostname, err := os.Hostname()
-        if err != nil {
-            log.Fatalf("Failed to get hostname: %v", err)
-        }
-    
-        // 初始化 HyDFS 节点
-        hydfsNode, err := initHydfs(hostname, hostname, HydfsBasePort, true)
-        if err != nil {
-            log.Fatalf("Failed to initialize HyDFS: %v", err)
-        }
-    
-        // 上传文件
-        if err := hydfsNode.CreateFile("client", os.Args[2], os.Args[3]); err != nil {
-            log.Fatalf("Failed to upload file: %v", err)
-        }
-        return
     }
 
     pattern1 := os.Args[1]   

@@ -3248,10 +3248,6 @@ func handleCommands(n *Node) {
             handleLeave(n)
             return
 
-        case "measure":
-            fmt.Println("Starting measurements... This may take a while...")
-            RunAllMeasurements(n)
-
         case "help":
             printHelp()
 

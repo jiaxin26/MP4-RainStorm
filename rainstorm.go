@@ -851,6 +851,37 @@ func main() {
         leader.Tasks[task2.ID] = task2
         leader.mutex.Unlock()
 
+        go func() {
+            time.Sleep(5 * time.Second)
+            
+            leader.mutex.Lock()
+            // 获取所有worker
+            workers := make([]*Worker, 0, len(leader.Workers))
+            for _, w := range leader.Workers {
+                workers = append(workers, w)
+            }
+            
+            if len(workers) > 0 {
+                // 分配第一个任务
+                if err := leader.assignTaskToWorker(task1, workers[0]); err != nil {
+                    log.Printf("Failed to assign task1: %v", err)
+                }
+                
+                // 如果有第二个worker，分配第二个任务
+                if len(workers) > 1 {
+                    if err := leader.assignTaskToWorker(task2, workers[1]); err != nil {
+                        log.Printf("Failed to assign task2: %v", err)
+                    }
+                } else {
+                    // 如果只有一个worker，也分配给它
+                    if err := leader.assignTaskToWorker(task2, workers[0]); err != nil {
+                        log.Printf("Failed to assign task2: %v", err)
+                    }
+                }
+            }
+            leader.mutex.Unlock()
+        }()
+
         log.Printf("Leader starting with %d tasks to be assigned", numTasks)
         log.Printf("HyDFS port: %d, Leader port: %d", hydfsPort, LeaderPort)
         

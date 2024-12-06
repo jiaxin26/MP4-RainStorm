@@ -616,7 +616,7 @@ func (w *Worker) processFilterTask(task *Task, records []Record) ([]Record, erro
 
         // 查找OBJECTID和Sign_Type列
         var objectID, signType string
-        for i, field := range fields {
+        for _, field := range fields {
             field = strings.TrimSpace(field)
             if strings.Contains(strings.ToLower(field), "objectid") {
                 objectID = field
@@ -649,7 +649,7 @@ func (w *Worker) processCountTask(task *Task, records []Record) ([]Record, error
 
         fields := strings.Split(record.Value, ",")
         var signPost, category string
-        for i, field := range fields {
+        for _, field := range fields {
             field = strings.TrimSpace(field)
             if strings.Contains(strings.ToLower(field), "sign post") {
                 signPost = field
@@ -770,10 +770,10 @@ func main() {
         os.Exit(1)
     }
 
-    str1 := os.Args[1]        // 匹配模式1
-    str2 := os.Args[2]        // Sign Post类型
-    srcFile := os.Args[3]     // 输入文件
-    destFile := os.Args[4]    // 输出文件
+    pattern1 := os.Args[1]    // 匹配模式1
+    signPostType := os.Args[2] // Sign Post类型
+    inputFile := os.Args[3]    // 输入文件
+    outputFile := os.Args[4]   // 输出文件
     numTasks, _ := strconv.Atoi(os.Args[5])
     role := os.Args[6]
 
@@ -784,21 +784,40 @@ func main() {
     }
 
     // 初始化HyDFS节点
-    isIntroducer := role == "leader" // leader节点作为introducer
+    isIntroducer := role == "leader"
     hydfsNode, err := initHydfs(hostname, hostname, DefaultHyDFSPort, isIntroducer)
     if err != nil {
         log.Fatalf("Failed to initialize HyDFS: %v", err)
     }
 
-    // 启动HyDFS节点
-    if err := hydfsNode.Start(); err != nil {
-        log.Fatalf("Failed to start HyDFS node: %v", err)
-    }
-
-    // 根据角色启动服务
     switch role {
     case "leader":
         leader := NewLeader(hydfsNode)
+        // 创建初始任务
+        task1 := &Task{
+            ID:         "filter_task",
+            Type:      OpTransform,
+            Pattern:   pattern1,
+            InputFiles: []string{inputFile},
+            OutputFile: outputFile + "_app1",
+        }
+        task2 := &Task{
+            ID:         "count_task",
+            Type:      OpAggregateByKey,
+            Pattern:   signPostType,
+            InputFiles: []string{inputFile},
+            OutputFile: outputFile + "_app2",
+        }
+        
+        // 添加任务到leader
+        leader.Tasks[task1.ID] = task1
+        leader.Tasks[task2.ID] = task2
+
+        // 设置任务数量
+        for i := 0; i < numTasks; i++ {
+            // 这里可以添加任务分配逻辑
+        }
+
         if err := leader.Start(); err != nil {
             log.Fatalf("Leader failed: %v", err)
         }

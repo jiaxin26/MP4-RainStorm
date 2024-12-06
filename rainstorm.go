@@ -186,7 +186,7 @@ func (l *Leader) handleConnection(conn net.Conn) {
     case "TASK_FAILED":
         response = l.handleTaskFailure(msg)
     default:
-        response = Message{Type: "handleConnection ERROR", Data: "unknown message type"}
+        response = Message{Type: "ERROR", Data: "unknown message type"}
     }
 
     encoder := json.NewEncoder(conn)
@@ -472,7 +472,7 @@ func (w *Worker) handleConnection(conn net.Conn) {
     case "ASSIGN_TASK":
         response = w.handleTaskAssignment(msg)
     default:
-        response = Message{Type: "ERROR", Data: "unknown message type"}
+        response = Message{Type: "Worker handleConnection ERROR", Data: "unknown message type"}
     }
 
     encoder := json.NewEncoder(conn)

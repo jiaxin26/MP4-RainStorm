@@ -547,23 +547,19 @@ func (w *Worker) executeTask(task *Task) {
         return
     }
 
-    // 完成任务
     w.completeTask(task)
 }
 
 func (w *Worker) readInput(task *Task) ([]Record, error) {
     var records []Record
 
-    for _, inputFile := range task.InputFiles {
-        // 创建临时文件
+    for i, inputFile := range task.InputFiles {
         tempFile := fmt.Sprintf("/tmp/%s_%s", task.ID, filepath.Base(inputFile))
-        
-        // 从HyDFS读取文件
+        // 从HyDFS获取文件
         if err := w.HyDFS.GetFile(w.ID, inputFile, tempFile); err != nil {
             return nil, fmt.Errorf("failed to get file from HyDFS: %v", err)
         }
 
-        // 读取记录
         file, err := os.Open(tempFile)
         if err != nil {
             os.Remove(tempFile)
@@ -572,11 +568,29 @@ func (w *Worker) readInput(task *Task) ([]Record, error) {
 
         scanner := bufio.NewScanner(file)
         lineNum := 0
-        // 跳过标题行
-        if scanner.Scan() {
-            lineNum++
+        var colMap map[string]int
+        if i == 0 {
+            if scanner.Scan() {
+                headerLine := scanner.Text()
+                headerFields := strings.Split(headerLine, ",")
+                colMap = make(map[string]int)
+                for j, colName := range headerFields {
+                    colMap[strings.TrimSpace(colName)] = j
+                }
+                task.ColMap = colMap
+                lineNum++
+            } else {
+                return nil, fmt.Errorf("file %s is empty", inputFile)
+            }
+        } else {
+            // 对于后续文件，如果要求同样的格式，可直接跳过表头行
+            if scanner.Scan() {
+                // 跳过表头行
+                lineNum++
+            }
         }
 
+        // 读取数据行
         for scanner.Scan() {
             lineNum++
             line := scanner.Text()
@@ -596,49 +610,57 @@ func (w *Worker) readInput(task *Task) ([]Record, error) {
             return nil, fmt.Errorf("error reading file: %v", err)
         }
     }
-
     return records, nil
 }
 
-func (w *Worker) processFilterTask(task *Task, records []Record) ([]Record, error) {
+
+func (w *Worker) processFilterTask(task *Task, records []Record, colMap map[string]int) ([]Record, error) {
     var results []Record
+
+    objectIDIndex, ok1 := colMap["OBJECTID"]
+    signTypeIndex, ok2 := colMap["Sign_Type"]
+    if !ok1 || !ok2 {
+        return nil, fmt.Errorf("missing required columns: OBJECTID or Sign_Type")
+    }
+
     for _, record := range records {
         if task.ProcessedIDs[record.UniqueID] {
-            continue // 跳过重复记录
+            continue
         }
 
-        // 拆分CSV行
-        fields := strings.Split(record.Value, ",")
+        // 全行搜索pattern
         if !strings.Contains(record.Value, task.Pattern) {
             continue
         }
 
-        // 查找OBJECTID和Sign_Type列
-        var objectID, signType string
-        for _, field := range fields {
-            field = strings.TrimSpace(field)
-            if strings.Contains(strings.ToLower(field), "objectid") {
-                objectID = field
-            } else if strings.Contains(strings.ToLower(field), "sign_type") {
-                signType = field
-            }
+        fields := strings.Split(record.Value, ",")
+        if len(fields) <= objectIDIndex || len(fields) <= signTypeIndex {
+            continue
         }
 
-        if objectID != "" && signType != "" {
-            results = append(results, Record{
-                Key:       objectID,
-                Value:     signType,
-                UniqueID:  record.UniqueID + "_filtered",
-                Timestamp: time.Now(),
-            })
-        }
+        objectID := strings.TrimSpace(fields[objectIDIndex])
+        signType := strings.TrimSpace(fields[signTypeIndex])
+
+        results = append(results, Record{
+            Key:       objectID,
+            Value:     signType,
+            UniqueID:  record.UniqueID + "_filtered",
+            Timestamp: time.Now(),
+        })
 
         task.ProcessedIDs[record.UniqueID] = true
     }
+
     return results, nil
 }
 
-func (w *Worker) processCountTask(task *Task, records []Record) ([]Record, error) {
+func (w *Worker) processCountTask(task *Task, records []Record, colMap map[string]int) ([]Record, error) {
+    signPostIndex, ok1 := colMap["Sign_Post"]
+    categoryIndex, ok2 := colMap["Category"]
+    if !ok1 || !ok2 {
+        return nil, fmt.Errorf("missing required columns: Sign_Post or Category")
+    }
+
     categoryCount := make(map[string]int64)
 
     for _, record := range records {
@@ -647,22 +669,32 @@ func (w *Worker) processCountTask(task *Task, records []Record) ([]Record, error
         }
 
         fields := strings.Split(record.Value, ",")
-        var signPost, category string
-        for _, field := range fields {
-            field = strings.TrimSpace(field)
-            if strings.Contains(strings.ToLower(field), "sign post") {
-                signPost = field
-            } else if strings.Contains(strings.ToLower(field), "category") {
-                category = field
-            }
+        if len(fields) <= signPostIndex || len(fields) <= categoryIndex {
+            continue
         }
 
-        // 检查是否匹配指定的Sign Post类型
+        signPost := strings.TrimSpace(fields[signPostIndex])
+        category := strings.TrimSpace(fields[categoryIndex])
+
         if signPost == task.Pattern {
             categoryCount[category]++
             task.ProcessedIDs[record.UniqueID] = true
         }
     }
+
+    var results []Record
+    for c, count := range categoryCount {
+        results = append(results, Record{
+            Key:       c,
+            Value:     strconv.FormatInt(count, 10),
+            UniqueID:  fmt.Sprintf("%s_count_%d", c, count),
+            Timestamp: time.Now(),
+        })
+    }
+
+    return results, nil
+}
+
 
     // 转换结果
     var results []Record

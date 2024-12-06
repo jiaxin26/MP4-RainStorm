@@ -3761,6 +3761,7 @@ func main() {
 func handleRainStorm(n *Node, args []string) {
     if len(args) != 7 {
         fmt.Println("Usage: rainstorm <str1> <str2> <hydfs_src_file> <hydfs_dest_file> <num_tasks> <role>")
+        fmt.Println("len:::::%d:::::arg1::::::%s:::::::arg2::::::%s", len(args), args[1], args[2])
         return
     }
 

@@ -995,14 +995,14 @@ func (w *Worker) sendToLeader(msg Message) {
     conn, err := net.Dial("tcp", w.Leader)
     if err != nil {
         log.Printf("Failed to connect to leader: %v", err)
-        // return
+        return
     }
     defer conn.Close()
 
     encoder := json.NewEncoder(conn)
     if err := encoder.Encode(msg); err != nil {
         log.Printf("Failed to send message to leader: %v", err)
-        // return
+        return
     }
 }
 

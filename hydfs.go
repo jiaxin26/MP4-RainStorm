@@ -636,6 +636,7 @@ func (w *Worker) Start() error {
                 log.Printf("Accept error: %v", err)
                 continue
             }
+            log.Printf("111111111111 w.handleConnection 111111111111")
             go w.handleConnection(conn)
         }
     }
@@ -692,6 +693,7 @@ func (w *Worker) handleConnection(conn net.Conn) {
     case "PING":
         response = Message{Type: "PONG"}
     case "ASSIGN_TASK":
+        log.Printf("222222222222 handleTaskAssignment 222222222222")
         response = w.handleTaskAssignment(msg)
     default:
         response = Message{Type: "Worker handleConnection ERROR", Data: "unknown message type"}
@@ -757,6 +759,8 @@ func (w *Worker) executeTask(task *Task) {
     case OpAggregateByKey:
         results, err = w.processCountTask(task, records)
     }
+
+    log.Printf("results::::::::::: %s", results)
 
     if err != nil {
         w.handleTaskError(task, err)

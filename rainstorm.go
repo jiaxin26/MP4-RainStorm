@@ -3,8 +3,9 @@ package main
 
 import (
     "bufio"
-    "encoding/csv"
+    "bytes"
     "encoding/json"
+    "errors"
     "fmt"
     "io"
     "io/ioutil"
@@ -13,761 +14,807 @@ import (
     "os"
     "os/exec"
     "path/filepath"
+    "sort"
     "strconv"
     "strings"
     "sync"
     "time"
 )
 
-// RainStorm配置常量
+// 系统常量
 const (
-    LeaderPort = 9000  // Leader节点端口
-    MaxRetries = 3     // 最大重试次数
-    BatchSize  = 1000  // 处理批次大小
-    LogPrefix  = "[RainStorm] "
+    LeaderPort = 8000
+    WorkerBasePort = 8001
+    MaxBatchSize = 1000
+    BatchTimeout = 100 * time.Millisecond
+    TaskTimeout = 5 * time.Second
+    RetryInterval = 1 * time.Second
+    MaxRetries = 3
+    DefaultHyDFSPort = 5000
 )
 
-// 操作类型
-type OperationType int
-
-const (
-    Transform OperationType = iota
-    FilteredTransform
-    AggregateByKey
+// 错误定义
+var (
+    ErrTaskNotFound = errors.New("task not found")
+    ErrTaskFailed = errors.New("task execution failed")
+    ErrInvalidState = errors.New("invalid task state")
+    ErrDuplicateRecord = errors.New("duplicate record detected")
+    ErrInvalidFormat = errors.New("invalid record format")
 )
 
 // 任务状态
-type TaskStatus int
+type TaskState int
 
 const (
-    TaskPending TaskStatus = iota
-    TaskRunning
-    TaskCompleted
-    TaskFailed
+    TaskStateInit TaskState = iota
+    TaskStateRunning
+    TaskStateCompleted
+    TaskStateFailed
 )
 
-// 数据元组
-type Tuple struct {
-    Key   string      `json:"key"`
-    Value interface{} `json:"value"`
+// 操作类型
+type OperatorType int
+
+const (
+    OpTransform OperatorType = iota
+    OpFilteredTransform
+    OpAggregateByKey
+)
+
+// Message 结构体定义
+type Message struct {
+    Type      string      `json:"type"`
+    Data      interface{} `json:"data"`
+    Timestamp time.Time   `json:"timestamp"`
 }
 
-// 任务信息
-type TaskInfo struct {
-    ID          string      `json:"id"`
-    Type        string      `json:"type"`
-    Status      TaskStatus  `json:"status"`
-    WorkerID    string      `json:"worker_id"`
-    InputFile   string      `json:"input_file"`
-    OutputFile  string      `json:"output_file"`
-    StartTime   time.Time   `json:"start_time"`
-    LastUpdated time.Time   `json:"last_updated"`
+// Record 表示一条数据记录
+type Record struct {
+    Key       string    `json:"key"`
+    Value     string    `json:"value"`
+    UniqueID  string    `json:"unique_id"`
+    Timestamp time.Time `json:"timestamp"`
 }
 
-// Worker状态
-type WorkerState struct {
-    ID            string    `json:"id"`
-    Address       string    `json:"address"`
-    Port          int       `json:"port"`
-    LastHeartbeat time.Time `json:"last_heartbeat"`
-    Tasks         []string  `json:"tasks"`
+// Task 表示一个处理任务
+type Task struct {
+    ID           string            `json:"id"`
+    Type         OperatorType      `json:"type"`
+    State        TaskState         `json:"state"`
+    InputFiles   []string          `json:"input_files"`
+    OutputFile   string           `json:"output_file"`
+    Pattern      string           `json:"pattern"`
+    ProcessedIDs map[string]bool   `json:"processed_ids"`
+    StateData    map[string]int64  `json:"state_data"`
+    StartTime    time.Time         `json:"start_time"`
+    LastUpdate   time.Time         `json:"last_update"`
+    mutex        sync.RWMutex
 }
 
-// RainStorm系统
-type RainStorm struct {
-    isLeader      bool
-    leaderAddress string
-    workerID      string
-    config        *Config
-    workers       map[string]*WorkerState
-    tasks         map[string]*TaskInfo
+// Worker 表示一个工作节点
+type Worker struct {
+    ID        string
+    Address   string
+    Port      int
+    Tasks     map[string]*Task
+    HyDFS     *Node  // HyDFS节点实例
+    Leader    string // Leader地址
+    mutex     sync.RWMutex
+    stopChan  chan struct{}
+}
+
+// Leader 表示主节点
+type Leader struct {
+    Workers       map[string]*Worker
+    Tasks         map[string]*Task
+    Assignments   map[string][]string
+    HyDFS         *Node
     mutex         sync.RWMutex
-    logger        *log.Logger
+    stopChan      chan struct{}
 }
 
-// 系统配置
-type Config struct {
-    Op1Executable    string
-    Op2Executable    string
-    SourceFile       string
-    DestFile         string
-    NumTasks         int
-    WorkerPort       int
-    HydfsNode       *Node  // 复用你的HyDFS Node结构
-}
-
-// 操作符接口
-type Operator interface {
-    Process(input []*Tuple) ([]*Tuple, error)
-    GetState() ([]byte, error)
-    RestoreState(state []byte) error
-}
-
-// 任务结果
-type TaskResult struct {
-    TaskID  string
-    Success bool
-    Error   error
-    Data    []*Tuple
-}
-
-// 创建新的RainStorm实例
-func NewRainStorm(config *Config, isLeader bool) (*RainStorm, error) {
-    rs := &RainStorm{
-        isLeader:      isLeader,
-        leaderAddress: fmt.Sprintf("localhost:%d", LeaderPort),
-        config:        config,
-        workers:       make(map[string]*WorkerState),
-        tasks:         make(map[string]*TaskInfo),
-        logger:        log.New(os.Stdout, LogPrefix, log.LstdFlags),
+// 创建新的Leader
+func NewLeader(hydfsNode *Node) *Leader {
+    return &Leader{
+        Workers:     make(map[string]*Worker),
+        Tasks:       make(map[string]*Task),
+        Assignments: make(map[string][]string),
+        HyDFS:      hydfsNode,
+        stopChan:   make(chan struct{}),
     }
-
-    // 如果是leader，初始化任务管理
-    if isLeader {
-        if err := rs.initializeLeader(); err != nil {
-            return nil, fmt.Errorf("failed to initialize leader: %v", err)
-        }
-    }
-
-    return rs, nil
 }
 
-// 初始化Leader节点
-func (rs *RainStorm) initializeLeader() error {
-    // 启动TCP监听
+// 创建新的Worker
+func NewWorker(id, address string, port int, hydfsNode *Node, leaderAddr string) *Worker {
+    return &Worker{
+        ID:       id,
+        Address:  address,
+        Port:     port,
+        Tasks:    make(map[string]*Task),
+        HyDFS:    hydfsNode,
+        Leader:   leaderAddr,
+        stopChan: make(chan struct{}),
+    }
+}
+
+// Leader方法
+func (l *Leader) Start() error {
     listener, err := net.Listen("tcp", fmt.Sprintf(":%d", LeaderPort))
     if err != nil {
-        return fmt.Errorf("failed to start leader listener: %v", err)
+        return fmt.Errorf("failed to start leader: %v", err)
     }
+    defer listener.Close()
 
-    // 启动worker连接处理
-    go rs.handleConnections(listener)
+    log.Printf("Leader started on port %d", LeaderPort)
 
-    // 启动心跳检测
-    go rs.checkWorkerHeartbeats()
+    // 启动监控goroutine
+    go l.monitorWorkers()
 
-    rs.logger.Printf("Leader started on port %d", LeaderPort)
-    return nil
-}
-
-// 处理Worker连接
-func (rs *RainStorm) handleConnections(listener net.Listener) {
+    // 主循环处理连接
     for {
-        conn, err := listener.Accept()
-        if err != nil {
-            rs.logger.Printf("Error accepting connection: %v", err)
-            continue
+        select {
+        case <-l.stopChan:
+            return nil
+        default:
+            conn, err := listener.Accept()
+            if err != nil {
+                log.Printf("Accept error: %v", err)
+                continue
+            }
+            go l.handleConnection(conn)
         }
-        go rs.handleWorkerConnection(conn)
     }
 }
 
-// 处理Worker连接
-func (rs *RainStorm) handleWorkerConnection(conn net.Conn) {
+func (l *Leader) handleConnection(conn net.Conn) {
     defer conn.Close()
 
-    // 读取Worker注册信息
     decoder := json.NewDecoder(conn)
-    var msg struct {
-        Type     string `json:"type"`
-        WorkerID string `json:"worker_id"`
-        Port     int    `json:"port"`
-    }
-
+    var msg Message
     if err := decoder.Decode(&msg); err != nil {
-        rs.logger.Printf("Error decoding worker message: %v", err)
+        log.Printf("Failed to decode message: %v", err)
         return
     }
 
-    // 注册Worker
-    if msg.Type == "register" {
-        rs.mutex.Lock()
-        rs.workers[msg.WorkerID] = &WorkerState{
-            ID:            msg.WorkerID,
-            Address:       strings.Split(conn.RemoteAddr().String(), ":")[0],
-            Port:          msg.Port,
-            LastHeartbeat: time.Now(),
-        }
-        rs.mutex.Unlock()
-        rs.logger.Printf("Registered worker %s at %s:%d", msg.WorkerID, rs.workers[msg.WorkerID].Address, msg.Port)
+    var response Message
+    switch msg.Type {
+    case "REGISTER_WORKER":
+        response = l.handleWorkerRegistration(msg)
+    case "TASK_STATUS":
+        response = l.handleTaskStatus(msg)
+    case "TASK_COMPLETE":
+        response = l.handleTaskComplete(msg)
+    case "TASK_FAILED":
+        response = l.handleTaskFailure(msg)
+    default:
+        response = Message{Type: "ERROR", Data: "unknown message type"}
+    }
+
+    encoder := json.NewEncoder(conn)
+    if err := encoder.Encode(response); err != nil {
+        log.Printf("Failed to send response: %v", err)
     }
 }
 
-// 检查Worker心跳
-func (rs *RainStorm) checkWorkerHeartbeats() {
-    ticker := time.NewTicker(5 * time.Second)
-    for range ticker.C {
-        rs.mutex.Lock()
-        now := time.Now()
-        for id, worker := range rs.workers {
-            if now.Sub(worker.LastHeartbeat) > 15*time.Second {
-                rs.logger.Printf("Worker %s missed heartbeat, removing", id)
-                delete(rs.workers, id)
-                rs.handleWorkerFailure(id)
-            }
+func (l *Leader) handleWorkerRegistration(msg Message) Message {
+    data := msg.Data.(map[string]interface{})
+    workerID := data["worker_id"].(string)
+    address := data["address"].(string)
+    port := int(data["port"].(float64))
+
+    l.mutex.Lock()
+    l.Workers[workerID] = &Worker{
+        ID:      workerID,
+        Address: address,
+        Port:    port,
+        Tasks:   make(map[string]*Task),
+    }
+    l.mutex.Unlock()
+
+    log.Printf("Registered new worker: %s at %s:%d", workerID, address, port)
+    return Message{Type: "REGISTER_RESPONSE", Data: "OK"}
+}
+
+func (l *Leader) handleTaskStatus(msg Message) Message {
+    data := msg.Data.(map[string]interface{})
+    taskID := data["task_id"].(string)
+    status := TaskState(data["status"].(float64))
+
+    l.mutex.Lock()
+    if task, exists := l.Tasks[taskID]; exists {
+        task.State = status
+        task.LastUpdate = time.Now()
+        log.Printf("Updated task %s status to %v", taskID, status)
+    }
+    l.mutex.Unlock()
+
+    return Message{Type: "STATUS_RESPONSE"}
+}
+
+func (l *Leader) handleTaskComplete(msg Message) Message {
+    data := msg.Data.(map[string]interface{})
+    taskID := data["task_id"].(string)
+
+    l.mutex.Lock()
+    if task, exists := l.Tasks[taskID]; exists {
+        task.State = TaskStateCompleted
+        task.LastUpdate = time.Now()
+        log.Printf("Task %s completed", taskID)
+    }
+    l.mutex.Unlock()
+
+    return Message{Type: "COMPLETE_RESPONSE"}
+}
+
+func (l *Leader) handleTaskFailure(msg Message) Message {
+    data := msg.Data.(map[string]interface{})
+    taskID := data["task_id"].(string)
+    workerID := data["worker_id"].(string)
+
+    l.mutex.Lock()
+    if task, exists := l.Tasks[taskID]; exists {
+        task.State = TaskStateFailed
+        log.Printf("Task %s failed on worker %s", taskID, workerID)
+        // 重新调度任务
+        l.rescheduleTask(task, workerID)
+    }
+    l.mutex.Unlock()
+
+    return Message{Type: "FAILURE_RESPONSE"}
+}
+
+func (l *Leader) monitorWorkers() {
+    ticker := time.NewTicker(TaskTimeout / 2)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-l.stopChan:
+            return
+        case <-ticker.C:
+            l.checkWorkerHealth()
         }
-        rs.mutex.Unlock()
     }
 }
 
-// 处理Worker失败
-func (rs *RainStorm) handleWorkerFailure(workerID string) {
-    rs.mutex.Lock()
-    defer rs.mutex.Unlock()
+func (l *Leader) checkWorkerHealth() {
+    l.mutex.Lock()
+    defer l.mutex.Unlock()
 
-    // 找出失败Worker的任务
-    var failedTasks []*TaskInfo
-    for _, task := range rs.tasks {
-        if task.WorkerID == workerID {
-            task.Status = TaskFailed
-            failedTasks = append(failedTasks, task)
-        }
-    }
-
-    // 重新调度失败的任务
-    for _, task := range failedTasks {
-        if err := rs.rescheduleTask(task); err != nil {
-            rs.logger.Printf("Failed to reschedule task %s: %v", task.ID, err)
+    for workerID, worker := range l.Workers {
+        if err := l.pingWorker(worker); err != nil {
+            log.Printf("Worker %s failed health check: %v", workerID, err)
+            l.handleWorkerFailure(workerID)
         }
     }
 }
 
-// 重新调度任务
-func (rs *RainStorm) rescheduleTask(task *TaskInfo) error {
-    // 选择一个可用的Worker
-    var selectedWorker *WorkerState
-    for _, worker := range rs.workers {
-        if len(worker.Tasks) < rs.config.NumTasks {
-            selectedWorker = worker
+func (l *Leader) pingWorker(worker *Worker) error {
+    conn, err := net.DialTimeout("tcp", 
+        fmt.Sprintf("%s:%d", worker.Address, worker.Port),
+        time.Second)
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
+
+    msg := Message{Type: "PING"}
+    encoder := json.NewEncoder(conn)
+    if err := encoder.Encode(msg); err != nil {
+        return err
+    }
+
+    decoder := json.NewDecoder(conn)
+    var response Message
+    if err := decoder.Decode(&response); err != nil {
+        return err
+    }
+
+    if response.Type != "PONG" {
+        return errors.New("invalid ping response")
+    }
+
+    return nil
+}
+
+func (l *Leader) handleWorkerFailure(workerID string) {
+    // 获取失败worker的任务
+    tasks := l.Assignments[workerID]
+    delete(l.Assignments, workerID)
+    delete(l.Workers, workerID)
+
+    // 重新调度任务
+    for _, taskID := range tasks {
+        if task, exists := l.Tasks[taskID]; exists {
+            l.rescheduleTask(task, workerID)
+        }
+    }
+}
+
+func (l *Leader) rescheduleTask(task *Task, failedWorkerID string) {
+    // 找到新的worker
+    var newWorkerID string
+    for id := range l.Workers {
+        if id != failedWorkerID {
+            newWorkerID = id
             break
         }
     }
 
-    if selectedWorker == nil {
-        return fmt.Errorf("no available workers")
+    if newWorkerID == "" {
+        log.Printf("No available workers to reschedule task %s", task.ID)
+        return
     }
 
-    // 更新任务信息
-    task.WorkerID = selectedWorker.ID
-    task.Status = TaskPending
-    selectedWorker.Tasks = append(selectedWorker.Tasks, task.ID)
-
-    // 通知新Worker执行任务
-    return rs.assignTaskToWorker(task, selectedWorker)
+    worker := l.Workers[newWorkerID]
+    if err := l.assignTaskToWorker(task, worker); err != nil {
+        log.Printf("Failed to reschedule task %s: %v", task.ID, err)
+    }
 }
 
-// 分配任务给Worker
-func (rs *RainStorm) assignTaskToWorker(task *TaskInfo, worker *WorkerState) error {
-    // 准备任务分配消息
-    msg := struct {
-        Type     string    `json:"type"`
-        Task     *TaskInfo `json:"task"`
-        Op1Path  string    `json:"op1_path"`
-        Op2Path  string    `json:"op2_path"`
-    }{
-        Type:    "assign_task",
-        Task:    task,
-        Op1Path: rs.config.Op1Executable,
-        Op2Path: rs.config.Op2Executable,
+func (l *Leader) assignTaskToWorker(task *Task, worker *Worker) error {
+    msg := Message{
+        Type: "ASSIGN_TASK",
+        Data: map[string]interface{}{
+            "task_id":     task.ID,
+            "type":        task.Type,
+            "pattern":     task.Pattern,
+            "input_files": task.InputFiles,
+            "output_file": task.OutputFile,
+        },
     }
 
-    // 连接Worker
     conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", worker.Address, worker.Port))
     if err != nil {
-        return fmt.Errorf("failed to connect to worker: %v", err)
+        return err
     }
     defer conn.Close()
 
-    // 发送任务
     encoder := json.NewEncoder(conn)
     if err := encoder.Encode(msg); err != nil {
-        return fmt.Errorf("failed to send task: %v", err)
+        return err
     }
 
+    decoder := json.NewDecoder(conn)
+    var response Message
+    if err := decoder.Decode(&response); err != nil {
+        return err
+    }
+
+    if response.Type == "ERROR" {
+        return fmt.Errorf("task assignment failed: %v", response.Data)
+    }
+
+    l.Assignments[worker.ID] = append(l.Assignments[worker.ID], task.ID)
     return nil
 }
 
-// 执行操作符
-func executeOperator(opPath string, input []*Tuple) ([]*Tuple, error) {
-    // 将输入数据序列化为JSON
-    inputJSON, err := json.Marshal(input)
+// Worker方法
+func (w *Worker) Start() error {
+    // 注册到Leader
+    if err := w.registerWithLeader(); err != nil {
+        return err
+    }
+
+    // 启动任务处理服务
+    listener, err := net.Listen("tcp", fmt.Sprintf(":%d", w.Port))
     if err != nil {
-        return nil, fmt.Errorf("failed to marshal input: %v", err)
+        return err
     }
+    defer listener.Close()
 
-    // 创建临时输入文件
-    inputFile, err := ioutil.TempFile("", "rainstorm-input-*.json")
+    log.Printf("Worker started on port %d", w.Port)
+
+    for {
+        select {
+        case <-w.stopChan:
+            return nil
+        default:
+            conn, err := listener.Accept()
+            if err != nil {
+                log.Printf("Accept error: %v", err)
+                continue
+            }
+            go w.handleConnection(conn)
+        }
+    }
+}
+
+func (w *Worker) registerWithLeader() error {
+    conn, err := net.Dial("tcp", w.Leader)
     if err != nil {
-        return nil, fmt.Errorf("failed to create temp input file: %v", err)
+        return fmt.Errorf("failed to connect to leader: %v", err)
     }
-    defer os.Remove(inputFile.Name())
-    
-    if _, err := inputFile.Write(inputJSON); err != nil {
-        return nil, fmt.Errorf("failed to write input file: %v", err)
-    }
-    inputFile.Close()
+    defer conn.Close()
 
-    // 创建临时输出文件
-    outputFile, err := ioutil.TempFile("", "rainstorm-output-*.json")
+    msg := Message{
+        Type: "REGISTER_WORKER",
+        Data: map[string]interface{}{
+            "worker_id": w.ID,
+            "address":   w.Address,
+            "port":     w.Port,
+        },
+        Timestamp: time.Now(),
+    }
+
+    encoder := json.NewEncoder(conn)
+    if err := encoder.Encode(msg); err != nil {
+        return fmt.Errorf("failed to register: %v", err)
+    }
+
+    decoder := json.NewDecoder(conn)
+    var response Message
+    if err := decoder.Decode(&response); err != nil {
+        return fmt.Errorf("failed to receive response: %v", err)
+    }
+
+    if response.Type != "REGISTER_RESPONSE" {
+        return fmt.Errorf("unexpected response: %s", response.Type)
+    }
+
+    log.Printf("Successfully registered with leader")
+    return nil
+}
+
+func (w *Worker) handleConnection(conn net.Conn) {
+    defer conn.Close()
+
+    decoder := json.NewDecoder(conn)
+    var msg Message
+    if err := decoder.Decode(&msg); err != nil {
+        log.Printf("Failed to decode message: %v", err)
+        return
+    }
+
+    var response Message
+    switch msg.Type {
+    case "PING":
+        response = Message{Type: "PONG"}
+    case "ASSIGN_TASK":
+        response = w.handleTaskAssignment(msg)
+    default:
+        response = Message{Type: "ERROR", Data: "unknown message type"}
+    }
+
+    encoder := json.NewEncoder(conn)
+    if err := encoder.Encode(response); err != nil {
+        log.Printf("Failed to send response: %v", err)
+    }
+}
+
+func (w *Worker) handleTaskAssignment(msg Message) Message {
+    data := msg.Data.(map[string]interface{})
+    task := &Task{
+        ID:          data["task_id"].(string),
+        Type:        OperatorType(data["type"].(float64)),
+        Pattern:     data["pattern"].(string),
+        State:       TaskStateInit,
+        StartTime:   time.Now(),
+        LastUpdate:  time.Now(),
+        ProcessedIDs: make(map[string]bool),
+        StateData:    make(map[string]int64),
+    }
+
+    // 获取输入文件列表
+    inputFiles := data["input_files"].([]interface{})
+    task.InputFiles = make([]string, len(inputFiles))
+    for i, f := range inputFiles {
+        task.InputFiles[i] = f.(string)
+    }
+    task.OutputFile = data["output_file"].(string)
+
+    w.mutex.Lock()
+    w.Tasks[task.ID] = task
+    w.mutex.Unlock()
+
+    // 异步执行任务
+    go w.executeTask(task)
+
+    return Message{Type: "ASSIGN_RESPONSE", Data: "OK"}
+}
+
+func (w *Worker) executeTask(task *Task) {
+    log.Printf("Starting task %s", task.ID)
+
+    // 更新任务状态
+    task.mutex.Lock()
+    task.State = TaskStateRunning
+    task.mutex.Unlock()
+
+    // 读取和处理输入
+    records, err := w.readInput(task)
     if err != nil {
-        return nil, fmt.Errorf("failed to create temp output file: %v", err)
-    }
-    defer os.Remove(outputFile.Name())
-    outputFile.Close()
-
-    // 执行操作符程序
-    cmd := exec.Command(opPath, inputFile.Name(), outputFile.Name())
-    if err := cmd.Run(); err != nil {
-        return nil, fmt.Errorf("failed to execute operator: %v", err)
+        w.handleTaskError(task, err)
+        return
     }
 
-    // 读取输出
-    output, err := ioutil.ReadFile(outputFile.Name())
+    // 根据任务类型处理记录
+    var results []Record
+    switch task.Type {
+    case OpTransform:
+        results, err = w.processFilterTask(task, records)
+    case OpAggregateByKey:
+        results, err = w.processCountTask(task, records)
+    }
+
     if err != nil {
-        return nil, fmt.Errorf("failed to read output file: %v", err)
+        w.handleTaskError(task, err)
+        return
     }
 
-    // 解析输出
-    var results []*Tuple
-    if err := json.Unmarshal(output, &results); err != nil {
-        return nil, fmt.Errorf("failed to unmarshal output: %v", err)
+    // 写入结果
+    if err := w.writeResults(task, results); err != nil {
+        w.handleTaskError(task, err)
+        return
+    }
+
+    // 完成任务
+    w.completeTask(task)
+}
+
+func (w *Worker) readInput(task *Task) ([]Record, error) {
+    var records []Record
+
+    for _, inputFile := range task.InputFiles {
+        // 创建临时文件
+        tempFile := fmt.Sprintf("/tmp/%s_%s", task.ID, filepath.Base(inputFile))
+        
+        // 从HyDFS读取文件
+        if err := w.HyDFS.GetFile(w.ID, inputFile, tempFile); err != nil {
+            return nil, fmt.Errorf("failed to get file from HyDFS: %v", err)
+        }
+
+        // 读取记录
+        file, err := os.Open(tempFile)
+        if err != nil {
+            os.Remove(tempFile)
+            return nil, fmt.Errorf("failed to open temp file: %v", err)
+        }
+
+        scanner := bufio.NewScanner(file)
+        lineNum := 0
+        // 跳过标题行
+        if scanner.Scan() {
+            lineNum++
+        }
+
+        for scanner.Scan() {
+            lineNum++
+            line := scanner.Text()
+            record := Record{
+                Key:       fmt.Sprintf("%s:%d", inputFile, lineNum),
+                Value:     line,
+                UniqueID:  fmt.Sprintf("%s_%d", inputFile, lineNum),
+                Timestamp: time.Now(),
+            }
+            records = append(records, record)
+        }
+
+        file.Close()
+        os.Remove(tempFile)
+
+        if err := scanner.Err(); err != nil {
+            return nil, fmt.Errorf("error reading file: %v", err)
+        }
+    }
+
+    return records, nil
+}
+
+func (w *Worker) processFilterTask(task *Task, records []Record) ([]Record, error) {
+    var results []Record
+    for _, record := range records {
+        if task.ProcessedIDs[record.UniqueID] {
+            continue // 跳过重复记录
+        }
+
+        // 拆分CSV行
+        fields := strings.Split(record.Value, ",")
+        if !strings.Contains(record.Value, task.Pattern) {
+            continue
+        }
+
+        // 查找OBJECTID和Sign_Type列
+        var objectID, signType string
+        for i, field := range fields {
+            field = strings.TrimSpace(field)
+            if strings.Contains(strings.ToLower(field), "objectid") {
+                objectID = field
+            } else if strings.Contains(strings.ToLower(field), "sign_type") {
+                signType = field
+            }
+        }
+
+        if objectID != "" && signType != "" {
+            results = append(results, Record{
+                Key:       objectID,
+                Value:     signType,
+                UniqueID:  record.UniqueID + "_filtered",
+                Timestamp: time.Now(),
+            })
+        }
+
+        task.ProcessedIDs[record.UniqueID] = true
+    }
+    return results, nil
+}
+
+func (w *Worker) processCountTask(task *Task, records []Record) ([]Record, error) {
+    categoryCount := make(map[string]int64)
+
+    for _, record := range records {
+        if task.ProcessedIDs[record.UniqueID] {
+            continue
+        }
+
+        fields := strings.Split(record.Value, ",")
+        var signPost, category string
+        for i, field := range fields {
+            field = strings.TrimSpace(field)
+            if strings.Contains(strings.ToLower(field), "sign post") {
+                signPost = field
+            } else if strings.Contains(strings.ToLower(field), "category") {
+                category = field
+            }
+        }
+
+        // 检查是否匹配指定的Sign Post类型
+        if signPost == task.Pattern {
+            categoryCount[category]++
+            task.ProcessedIDs[record.UniqueID] = true
+        }
+    }
+
+    // 转换结果
+    var results []Record
+    for category, count := range categoryCount {
+        results = append(results, Record{
+            Key:       category,
+            Value:     strconv.FormatInt(count, 10),
+            UniqueID:  fmt.Sprintf("%s_count_%d", category, count),
+            Timestamp: time.Now(),
+        })
     }
 
     return results, nil
 }
 
-// Worker节点处理逻辑
-func (rs *RainStorm) runWorker() error {
-    // 启动Worker服务器
-    listener, err := net.Listen("tcp", fmt.Sprintf(":%d", rs.config.WorkerPort))
-    if err != nil {
-        return fmt.Errorf("failed to start worker listener: %v", err)
+func (w *Worker) writeResults(task *Task, results []Record) error {
+    if len(results) == 0 {
+        return nil
     }
 
-    // 注册到Leader
-    if err := rs.registerWithLeader(); err != nil {
-        return fmt.Errorf("failed to register with leader: %v", err)
+    // 准备输出数据
+    var buffer bytes.Buffer
+    for _, record := range results {
+        fmt.Fprintf(&buffer, "%s\t%s\n", record.Key, record.Value)
     }
 
-    // 启动心跳
-    go rs.sendHeartbeats()
-
-    // 处理任务请求
-    for {
-        conn, err := listener.Accept()
-        if err != nil {
-            rs.logger.Printf("Error accepting connection: %v", err)
-            continue
-        }
-        go rs.handleTaskRequest(conn)
+    // 创建临时文件
+    tempFile := fmt.Sprintf("/tmp/%s_output", task.ID)
+    if err := ioutil.WriteFile(tempFile, buffer.Bytes(), 0644); err != nil {
+        return fmt.Errorf("failed to write temp file: %v", err)
     }
+    defer os.Remove(tempFile)
+
+    // 追加到HyDFS输出文件
+    return w.HyDFS.AppendFile(w.ID, tempFile, task.OutputFile)
 }
 
-// 注册到Leader
-func (rs *RainStorm) registerWithLeader() error {
-    conn, err := net.Dial("tcp", rs.leaderAddress)
+func (w *Worker) completeTask(task *Task) {
+    task.mutex.Lock()
+    task.State = TaskStateCompleted
+    task.LastUpdate = time.Now()
+    task.mutex.Unlock()
+
+    log.Printf("Task %s completed successfully", task.ID)
+
+    // 通知Leader任务完成
+    w.notifyTaskComplete(task)
+}
+
+func (w *Worker) handleTaskError(task *Task, err error) {
+    log.Printf("Task %s failed: %v", task.ID, err)
+    
+    task.mutex.Lock()
+    task.State = TaskStateFailed
+    task.LastUpdate = time.Now()
+    task.mutex.Unlock()
+
+    // 通知Leader任务失败
+    w.notifyTaskFailed(task)
+}
+
+func (w *Worker) notifyTaskComplete(task *Task) {
+    msg := Message{
+        Type: "TASK_COMPLETE",
+        Data: map[string]interface{}{
+            "task_id":   task.ID,
+            "worker_id": w.ID,
+        },
+        Timestamp: time.Now(),
+    }
+    w.sendToLeader(msg)
+}
+
+func (w *Worker) notifyTaskFailed(task *Task) {
+    msg := Message{
+        Type: "TASK_FAILED",
+        Data: map[string]interface{}{
+            "task_id":   task.ID,
+            "worker_id": w.ID,
+        },
+        Timestamp: time.Now(),
+    }
+    w.sendToLeader(msg)
+}
+
+func (w *Worker) sendToLeader(msg Message) {
+    conn, err := net.Dial("tcp", w.Leader)
     if err != nil {
-        return fmt.Errorf("failed to connect to leader: %v", err)
+        log.Printf("Failed to connect to leader: %v", err)
+        return
     }
     defer conn.Close()
-
-    // 发送注册消息
-    msg := struct {
-        Type     string `json:"type"`
-        WorkerID string `json:"worker_id"`
-        Port     int    `json:"port"`
-    }{
-        Type:     "register",
-        WorkerID: rs.workerID,
-        Port:     rs.config.WorkerPort,
-    }
 
     encoder := json.NewEncoder(conn)
     if err := encoder.Encode(msg); err != nil {
-        return fmt.Errorf("failed to send registration: %v", err)
-    }
-
-    return nil
-}
-
-// 发送心跳
-func (rs *RainStorm) sendHeartbeats() {
-    ticker := time.NewTicker(5 * time.Second)
-    for range ticker.C {
-        if err := rs.sendHeartbeat(); err != nil {
-            rs.logger.Printf("Failed to send heartbeat: %v", err)
-        }
-    }
-}
-
-// 发送单个心跳
-func (rs *RainStorm) sendHeartbeat() error {
-    conn, err := net.Dial("tcp", rs.leaderAddress)
-    if err != nil {
-        return fmt.Errorf("failed to connect to leader: %v", err)
-    }
-    defer conn.Close()
-
-    msg := struct {
-        Type     string `json:"type"`
-        WorkerID string `json:"worker_id"`
-    }{
-        Type:     "heartbeat",
-        WorkerID: rs.workerID,
-    }
-
-    encoder := json.NewEncoder(conn)
-    if err := encoder.Encode(msg); err != nil {
-        return fmt.Errorf("failed to send heartbeat: %v", err)
-    }
-
-    return nil
-}
-
-// 处理任务请求
-func (rs *RainStorm) handleTaskRequest(conn net.Conn) {
-    defer conn.Close()
-
-    // 解析任务请求
-    var msg struct {
-        Type    string    `json:"type"`
-        Task    *TaskInfo `json:"task"`
-        Op1Path string    `json:"op1_path"`
-        Op2Path string    `json:"op2_path"`
-    }
-
-    decoder := json.NewDecoder(conn)
-    if err := decoder.Decode(&msg); err != nil {
-        rs.logger.Printf("Error decoding task request: %v", err)
+        log.Printf("Failed to send message to leader: %v", err)
         return
     }
-
-    // 执行任务
-    if msg.Type == "assign_task" {
-        go rs.executeTask(msg.Task, msg.Op1Path, msg.Op2Path)
-    }
-}
-
-// 执行任务
-func (rs *RainStorm) executeTask(task *TaskInfo, op1Path, op2Path string) {
-    rs.logger.Printf("Starting task %s", task.ID)
-
-    // 更新任务状态
-    task.Status = TaskRunning
-    task.StartTime = time.Now()
-
-    // 创建日志文件
-    logFile := filepath.Join("logs", fmt.Sprintf("task_%s.log", task.ID))
-    if err := os.MkdirAll("logs", 0755); err != nil {
-        rs.logger.Printf("Failed to create log directory: %v", err)
-        return
-    }
-
-    logger := log.New(os.Stdout, fmt.Sprintf("[Task %s] ", task.ID), log.LstdFlags)
-    
-    // 从HyDFS读取输入数据
-    input, err := rs.readFromHydfs(task.InputFile)
-    if err != nil {
-        logger.Printf("Failed to read input: %v", err)
-        task.Status = TaskFailed
-        return
-    }
-
-    // 执行第一阶段操作符
-    output1, err := executeOperator(op1Path, input)
-    if err != nil {
-        logger.Printf("Failed to execute first operator: %v", err)
-        task.Status = TaskFailed
-        return
-    }
-
-    // 执行第二阶段操作符
-    output2, err := executeOperator(op2Path, output1)
-    if err != nil {
-        logger.Printf("Failed to execute second operator: %v", err)
-        task.Status = TaskFailed
-        return
-    }
-
-    // 将结果写入HyDFS
-    if err := rs.writeToHydfs(task.OutputFile, output2); err != nil {
-        logger.Printf("Failed to write output: %v", err)
-        task.Status = TaskFailed
-        return
-    }
-
-    task.Status = TaskCompleted
-    task.LastUpdated = time.Now()
-    logger.Printf("Task completed successfully")
-}
-
-// 从HyDFS读取数据
-func (rs *RainStorm) readFromHydfs(filename string) ([]*Tuple, error) {
-    // 使用HyDFS节点读取文件
-    tempFile, err := ioutil.TempFile("", "hydfs-input-*")
-    if err != nil {
-        return nil, fmt.Errorf("failed to create temp file: %v", err)
-    }
-    defer os.Remove(tempFile.Name())
-    
-    if err := rs.config.HydfsNode.GetFile("client1", filename, tempFile.Name()); err != nil {
-        return nil, fmt.Errorf("failed to get file from HyDFS: %v", err)
-    }
-
-    // 读取文件内容
-    data, err := ioutil.ReadFile(tempFile.Name())
-    if err != nil {
-        return nil, fmt.Errorf("failed to read temp file: %v", err)
-    }
-
-    // 将数据转换为元组
-    var tuples []*Tuple
-    scanner := bufio.NewScanner(strings.NewReader(string(data)))
-    lineNum := 0
-    for scanner.Scan() {
-        lineNum++
-        tuples = append(tuples, &Tuple{
-            Key:   fmt.Sprintf("%s:%d", filename, lineNum),
-            Value: scanner.Text(),
-        })
-    }
-
-    return tuples, scanner.Err()
-}
-
-// 写入数据到HyDFS
-func (rs *RainStorm) writeToHydfs(filename string, tuples []*Tuple) error {
-    // 创建临时文件
-    tempFile, err := ioutil.TempFile("", "hydfs-output-*")
-    if err != nil {
-        return fmt.Errorf("failed to create temp file: %v", err)
-    }
-    defer os.Remove(tempFile.Name())
-
-    // 写入数据
-    writer := bufio.NewWriter(tempFile)
-    for _, tuple := range tuples {
-        if _, err := fmt.Fprintf(writer, "%v\n", tuple.Value); err != nil {
-            return fmt.Errorf("failed to write tuple: %v", err)
-        }
-    }
-    
-    if err := writer.Flush(); err != nil {
-        return fmt.Errorf("failed to flush writer: %v", err)
-    }
-    
-    if err := tempFile.Close(); err != nil {
-        return fmt.Errorf("failed to close temp file: %v", err)
-    }
-
-    // 使用HyDFS节点写入文件
-    if err := rs.config.HydfsNode.CreateFile("client1", tempFile.Name(), filename); err != nil {
-        return fmt.Errorf("failed to create file in HyDFS: %v", err)
-    }
-
-    return nil
-}
-
-// 启动RainStorm系统
-func (rs *RainStorm) Start() error {
-    if rs.isLeader {
-        return rs.runLeader()
-    }
-    return rs.runWorker()
-}
-
-// 运行Leader节点
-func (rs *RainStorm) runLeader() error {
-    // 验证输入文件存在
-    if exists, err := rs.config.HydfsNode.FileExists(rs.config.SourceFile); !exists || err != nil {
-        return fmt.Errorf("source file %s not found in HyDFS", rs.config.SourceFile)
-    }
-
-    // 初始化任务
-    if err := rs.initializeTasks(); err != nil {
-        return fmt.Errorf("failed to initialize tasks: %v", err)
-    }
-
-    // 等待所有任务完成
-    return rs.waitForCompletion()
-}
-
-// 初始化任务
-func (rs *RainStorm) initializeTasks() error {
-    // 获取文件大小
-    fileInfo, err := rs.config.HydfsNode.GetFileInfo(rs.config.SourceFile)
-    if err != nil {
-        return fmt.Errorf("failed to get file info: %v", err)
-    }
-
-    // 计算每个任务的数据范围
-    chunkSize := fileInfo.Size / int64(rs.config.NumTasks)
-    if chunkSize == 0 {
-        chunkSize = 1
-    }
-
-    // 创建任务
-    for i := 0; i < rs.config.NumTasks; i++ {
-        taskID := fmt.Sprintf("task-%d", i)
-        rs.tasks[taskID] = &TaskInfo{
-            ID:         taskID,
-            Status:     TaskPending,
-            InputFile:  rs.config.SourceFile,
-            OutputFile: fmt.Sprintf("%s.part%d", rs.config.DestFile, i),
-        }
-    }
-
-    return nil
-}
-
-// 等待所有任务完成
-func (rs *RainStorm) waitForCompletion() error {
-    ticker := time.NewTicker(time.Second)
-    defer ticker.Stop()
-
-    timeout := time.After(30 * time.Minute)
-
-    for {
-        select {
-        case <-ticker.C:
-            completed := 0
-            failed := 0
-
-            rs.mutex.RLock()
-            for _, task := range rs.tasks {
-                if task.Status == TaskCompleted {
-                    completed++
-                } else if task.Status == TaskFailed {
-                    failed++
-                }
-            }
-            rs.mutex.RUnlock()
-
-            if completed == len(rs.tasks) {
-                return rs.mergeFinalOutput()
-            }
-
-            if failed > 0 {
-                return fmt.Errorf("%d tasks failed", failed)
-            }
-
-        case <-timeout:
-            return fmt.Errorf("execution timed out")
-        }
-    }
-}
-
-// 合并最终输出
-func (rs *RainStorm) mergeFinalOutput() error {
-    // 创建临时文件
-    tempFile, err := ioutil.TempFile("", "final-output-*")
-    if err != nil {
-        return fmt.Errorf("failed to create temp file: %v", err)
-    }
-    defer os.Remove(tempFile.Name())
-
-    // 按顺序合并所有部分
-    writer := bufio.NewWriter(tempFile)
-    for i := 0; i < rs.config.NumTasks; i++ {
-        partFile := fmt.Sprintf("%s.part%d", rs.config.DestFile, i)
-        
-        // 从HyDFS读取部分文件
-        partTempFile, err := ioutil.TempFile("", "part-*")
-        if err != nil {
-            return fmt.Errorf("failed to create part temp file: %v", err)
-        }
-        defer os.Remove(partTempFile.Name())
-
-        if err := rs.config.HydfsNode.GetFile("client1", partFile, partTempFile.Name()); err != nil {
-            return fmt.Errorf("failed to get part file: %v", err)
-        }
-
-        // 复制内容
-        data, err := ioutil.ReadFile(partTempFile.Name())
-        if err != nil {
-            return fmt.Errorf("failed to read part file: %v", err)
-        }
-
-        if _, err := writer.Write(data); err != nil {
-            return fmt.Errorf("failed to write part data: %v", err)
-        }
-    }
-
-    if err := writer.Flush(); err != nil {
-        return fmt.Errorf("failed to flush final output: %v", err)
-    }
-
-    // 写入最终文件到HyDFS
-    if err := rs.config.HydfsNode.CreateFile("client1", tempFile.Name(), rs.config.DestFile); err != nil {
-        return fmt.Errorf("failed to create final output in HyDFS: %v", err)
-    }
-
-    return nil
 }
 
 func main() {
-    if len(os.Args) != 6 {
-        fmt.Printf("Usage: %s <op1_exe> <op2_exe> <hydfs_src_file> <hydfs_dest_file> <num_tasks>\n", os.Args[0])
+    if len(os.Args) < 7 {
+        fmt.Println("Usage: rainstorm <str1> <str2> <hydfs_src_file> <hydfs_dest_file> <num_tasks> <role>")
         os.Exit(1)
     }
 
-    // 解析命令行参数
-    op1Exe := os.Args[1]
-    op2Exe := os.Args[2]
-    sourceFile := os.Args[3]
-    destFile := os.Args[4]
-    numTasks, err := strconv.Atoi(os.Args[5])
+    str1 := os.Args[1]        // 匹配模式1
+    str2 := os.Args[2]        // Sign Post类型
+    srcFile := os.Args[3]     // 输入文件
+    destFile := os.Args[4]    // 输出文件
+    numTasks, _ := strconv.Atoi(os.Args[5])
+    role := os.Args[6]
+
+    // 获取主机名作为节点ID
+    hostname, err := os.Hostname()
     if err != nil {
-        fmt.Printf("Invalid number of tasks: %v\n", err)
-        os.Exit(1)
+        log.Fatalf("Failed to get hostname: %v", err)
     }
 
-    // 验证可执行文件
-    if _, err := exec.LookPath(op1Exe); err != nil {
-        fmt.Printf("Operator 1 executable not found: %v\n", err)
-        os.Exit(1)
-    }
-    if _, err := exec.LookPath(op2Exe); err != nil {
-        fmt.Printf("Operator 2 executable not found: %v\n", err)
-        os.Exit(1)
-    }
-
-    // 创建HyDFS节点
-    hydfsNode, err := NewNode("rainstorm-client", "localhost", 9001)
+    // 初始化HyDFS节点
+    hydfsNode, err := NewNode(hostname, hostname, DefaultHyDFSPort)
     if err != nil {
-        fmt.Printf("Failed to create HyDFS node: %v\n", err)
-        os.Exit(1)
+        log.Fatalf("Failed to create HyDFS node: %v", err)
     }
 
     // 启动HyDFS节点
     if err := hydfsNode.Start(); err != nil {
-        fmt.Printf("Failed to start HyDFS node: %v\n", err)
-        os.Exit(1)
+        log.Fatalf("Failed to start HyDFS node: %v", err)
     }
 
-    // 配置RainStorm
-    config := &Config{
-        Op1Executable: op1Exe,
-        Op2Executable: op2Exe,
-        SourceFile:    sourceFile,
-        DestFile:      destFile,
-        NumTasks:      numTasks,
-        WorkerPort:    9002,
-        HydfsNode:     hydfsNode,
-    }
+    // 根据角色启动服务
+    switch role {
+    case "leader":
+        leader := NewLeader(hydfsNode)
+        if err := leader.Start(); err != nil {
+            log.Fatalf("Leader failed: %v", err)
+        }
 
-    // 创建并启动RainStorm Leader
-    rs, err := NewRainStorm(config, true)
-    if err != nil {
-        fmt.Printf("Failed to create RainStorm: %v\n", err)
-        os.Exit(1)
-    }
+    case "worker":
+        worker := NewWorker(
+            hostname,
+            hostname,
+            WorkerBasePort,
+            hydfsNode,
+            fmt.Sprintf("localhost:%d", LeaderPort),
+        )
+        if err := worker.Start(); err != nil {
+            log.Fatalf("Worker failed: %v", err)
+        }
 
-    // 启动系统
-    if err := rs.Start(); err != nil {
-        fmt.Printf("RainStorm execution failed: %v\n", err)
-        os.Exit(1)
+    default:
+        log.Fatalf("Unknown role: %s", role)
     }
-
-    fmt.Println("RainStorm execution completed successfully")
 }

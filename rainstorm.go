@@ -776,6 +776,8 @@ func main() {
     numTasks, _ := strconv.Atoi(os.Args[5])
     role := os.Args[6]
 
+    nodeNum := 1
+
     // 获取主机名作为节点ID
     hostname, err := os.Hostname()
     if err != nil {

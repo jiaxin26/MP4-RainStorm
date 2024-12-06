@@ -3139,30 +3139,7 @@ func (n *Node) syncMergedFile(fileInfo *FileInfo, content []byte) error {
 
 // 主函数和命令行处理
 
-func main() {
-    // 解析命令行参数
-    if len(os.Args) < 4 {
-        fmt.Println("Usage: ./hydfs <node_id> <address> <port> [introducer]")
-        fmt.Println("Example: ./hydfs node1 fa24-cs425-8101.cs.illinois.edu 9001")
-        fmt.Println("         ./hydfs node1 fa24-cs425-8101.cs.illinois.edu 9001 introducer")
-        os.Exit(1)
-    }
-
-    nodeID := os.Args[1]
-    address := os.Args[2]
-    port, err := strconv.Atoi(os.Args[3])
-    if err != nil {
-        fmt.Printf("Invalid port number: %v\n", err)
-        os.Exit(1)
-    }
-
-    // 如果是引导节点，设置环境变量
-    isIntroducer := len(os.Args) > 4 && os.Args[4] == "introducer"
-    if isIntroducer {
-        os.Setenv("INTRODUCER_HOST", address)
-        os.Setenv("INTRODUCER_PORT", strconv.Itoa(port))
-    }
-
+func initHydfs(nodeID, address string, port int, isIntroducer bool) (*Node, error) {
     // 设置日志
     logFile := setupLogging(nodeID)
     defer logFile.Close()
@@ -3170,8 +3147,7 @@ func main() {
     // 创建节点
     node, err := NewNode(nodeID, address, port)
     if err != nil {
-        fmt.Printf("Failed to create node: %v\n", err)
-        os.Exit(1)
+        return nil, fmt.Errorf("Failed to create node: %v", err)
     }
 
     // 设置信号处理
@@ -3179,26 +3155,20 @@ func main() {
 
     // 启动节点
     if err := node.Start(); err != nil {
-        fmt.Printf("Failed to start node: %v\n", err)
-        os.Exit(1)
+        return nil, fmt.Errorf("Failed to start node: %v", err)
     }
 
     // 处理引导节点和加入集群
     if isIntroducer {
         if err := node.StartIntroducer(); err != nil {
-            fmt.Printf("Failed to start introducer: %v\n", err)
-            os.Exit(1)
+            return nil, fmt.Errorf("Failed to start introducer: %v", err)
         }
     } else {
         if err := node.JoinCluster(); err != nil {
-            fmt.Printf("Failed to join cluster: %v\n", err)
-            os.Exit(1)
+            return nil, fmt.Errorf("Failed to join cluster: %v", err)
         }
     }
-
-    // 启动命令处理
-    fmt.Printf("\nNode %s started successfully. Type 'help' for available commands.\n", nodeID)
-    handleCommands(node)
+    return node, nil
 }
 
 func handleCommands(n *Node) {

@@ -655,6 +655,7 @@ func (w *Worker) processFilterTask(task *Task, records []Record, colMap map[stri
 }
 
 func (w *Worker) processCountTask(task *Task, records []Record, colMap map[string]int) ([]Record, error) {
+    // 获取所需列的索引
     signPostIndex, ok1 := colMap["Sign_Post"]
     categoryIndex, ok2 := colMap["Category"]
     if !ok1 || !ok2 {
@@ -676,12 +677,14 @@ func (w *Worker) processCountTask(task *Task, records []Record, colMap map[strin
         signPost := strings.TrimSpace(fields[signPostIndex])
         category := strings.TrimSpace(fields[categoryIndex])
 
+        // 检查signPost是否精确匹配task.Pattern
         if signPost == task.Pattern {
             categoryCount[category]++
             task.ProcessedIDs[record.UniqueID] = true
         }
     }
 
+    // 将计数结果转换为Record输出
     var results []Record
     for c, count := range categoryCount {
         results = append(results, Record{
@@ -695,20 +698,6 @@ func (w *Worker) processCountTask(task *Task, records []Record, colMap map[strin
     return results, nil
 }
 
-
-    // 转换结果
-    var results []Record
-    for category, count := range categoryCount {
-        results = append(results, Record{
-            Key:       category,
-            Value:     strconv.FormatInt(count, 10),
-            UniqueID:  fmt.Sprintf("%s_count_%d", category, count),
-            Timestamp: time.Now(),
-        })
-    }
-
-    return results, nil
-}
 
 func (w *Worker) writeResults(task *Task, results []Record) error {
     if len(results) == 0 {

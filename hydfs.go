@@ -745,7 +745,6 @@ func (w *Worker) executeTask(task *Task) {
     // 读取和处理输入
     records, err := w.readInput(task)
     if err != nil {
-        log.Printf("1111111111111111")
         w.handleTaskError(task, err)
         return
     }
@@ -755,7 +754,6 @@ func (w *Worker) executeTask(task *Task) {
     switch task.Type {
     case OpTransform:
         results, err = w.processFilterTask(task, records)
-        log.Printf("FilterTask results::::::::::: %s", results)
 
     case OpAggregateByKey:
         results, err = w.processCountTask(task, records)
@@ -763,13 +761,13 @@ func (w *Worker) executeTask(task *Task) {
     }
 
     if err != nil {
-        log.Printf("2222222222222222")
         w.handleTaskError(task, err)
         return
     }
 
     // 写入结果
     if err := w.writeResults(task, results); err != nil {
+        log.Printf("33333333333333333")
         w.handleTaskError(task, err)
         return
     }

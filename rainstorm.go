@@ -20,7 +20,7 @@ import (
 
 // 系统常量
 const (
-    LeaderPort = 8000
+    LeaderPort = 9001
     WorkerBasePort = 8001
     MaxBatchSize = 1000
     BatchTimeout = 100 * time.Millisecond

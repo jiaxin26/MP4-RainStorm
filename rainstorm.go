@@ -821,13 +821,15 @@ func main() {
         }
 
     case "worker":
-        leaderAddr := fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:%d", LeaderPort)
+        // leaderAddr := fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:%d", LeaderPort)
         worker := NewWorker(
             hostname,
             hostname,
             WorkerBasePort,
             hydfsNode,
-            leaderAddr, 
+            // leaderAddr,
+            fmt.Sprintf("localhost:%d", LeaderPort),
+
         )
         if err := worker.Start(); err != nil {
             log.Fatalf("Worker failed: %v", err)

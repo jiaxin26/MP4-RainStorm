@@ -531,9 +531,9 @@ func (w *Worker) executeTask(task *Task) {
     var results []Record
     switch task.Type {
     case OpTransform:
-        results, err = w.processFilterTask(task, records)
+        results, err = w.processFilterTask(task, records, colMap)
     case OpAggregateByKey:
-        results, err = w.processCountTask(task, records)
+        results, err = w.processCountTask(task, records, colMap)
     }
 
     if err != nil {

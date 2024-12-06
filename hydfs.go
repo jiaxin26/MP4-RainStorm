@@ -3704,14 +3704,10 @@ func (n *Node) syncMergedFile(fileInfo *FileInfo, content []byte) error {
     return nil
 }
 
-// 主函数和命令行处理
 
 func main() {
-    // 解析命令行参数
     if len(os.Args) < 4 {
         fmt.Println("Usage: ./hydfs <node_id> <address> <port> [introducer]")
-        fmt.Println("Example: ./hydfs node1 fa24-cs425-8101.cs.illinois.edu 9001")
-        fmt.Println("         ./hydfs node1 fa24-cs425-8101.cs.illinois.edu 9001 introducer")
         os.Exit(1)
     }
 
@@ -3723,34 +3719,28 @@ func main() {
         os.Exit(1)
     }
 
-    // 如果是引导节点，设置环境变量
     isIntroducer := len(os.Args) > 4 && os.Args[4] == "introducer"
     if isIntroducer {
         os.Setenv("INTRODUCER_HOST", address)
         os.Setenv("INTRODUCER_PORT", strconv.Itoa(port))
     }
 
-    // 设置日志
     logFile := setupLogging(nodeID)
     defer logFile.Close()
 
-    // 创建节点
     node, err := NewNode(nodeID, address, port)
     if err != nil {
         fmt.Printf("Failed to create node: %v\n", err)
         os.Exit(1)
     }
 
-    // 设置信号处理
     setupSignalHandler(node)
 
-    // 启动节点
     if err := node.Start(); err != nil {
         fmt.Printf("Failed to start node: %v\n", err)
         os.Exit(1)
     }
 
-    // 处理引导节点和加入集群
     if isIntroducer {
         if err := node.StartIntroducer(); err != nil {
             fmt.Printf("Failed to start introducer: %v\n", err)
@@ -3774,130 +3764,99 @@ func handleRainStorm(n *Node, args []string) {
         return
     }
 
-    pattern1 := os.Args[1]   
-    signPostType := os.Args[2] 
-    inputFile := os.Args[3]    
-    outputFile := os.Args[4]  
-    numTasks, _ := strconv.Atoi(os.Args[5])
-    role := os.Args[6]
+    pattern1 := args[1]
+    signPostType := args[2]
+    inputFile := args[3]
+    outputFile := args[4]
+    numTasks, _ := strconv.Atoi(args[5])
+    role := args[6]
 
-    // 获取主机名作为节点ID
-    hostname, err := os.Hostname()
-    if err != nil {
-        log.Fatalf("Failed to get hostname: %v", err)
-    }
-    
-    var hydfsPort int
-    tmpHostname := strings.TrimPrefix(hostname, "fa24-cs425-")
-    tmpHostname = strings.TrimSuffix(tmpHostname, ".cs.illinois.edu")
-    nodeNum, _ := strconv.Atoi(tmpHostname)
-    hydfsPort = HydfsBasePort + (nodeNum - 8101)  
-
-    if role == "leader" {
-        hydfsPort = HydfsBasePort  
-    } 
-
-    // 初始化HyDFS节点
-    isIntroducer := role == "leader"
-    hydfsNode, err := initHydfs(hostname, hostname, hydfsPort, isIntroducer)
-    if err != nil {
-        log.Fatalf("Failed to initialize HyDFS: %v", err)
-    }
+    // 我们假设在 main() 中已经调用 node.Start() 并加入或作为引导节点加入集群。
+    // 因此这里不需要再次 initHydfs，因为 n 已经是一个运行中的 HyDFS 节点。
 
     switch role {
     case "leader":
-        leader := NewLeader(hydfsNode)
+        leader := NewLeader(n)
         
         task1 := &Task{
-            ID:         "filter_task",
-            Type:      OpTransform,
-            Pattern:   pattern1,
-            InputFiles: []string{inputFile},
-            OutputFile: outputFile + "_app1",
+            ID:          "filter_task",
+            Type:        OpTransform,
+            Pattern:     pattern1,
+            InputFiles:  []string{inputFile},
+            OutputFile:  outputFile + "_app1",
             ProcessedIDs: make(map[string]bool),
         }
         
         task2 := &Task{
-            ID:         "count_task",
-            Type:      OpAggregateByKey,
-            Pattern:   signPostType,
-            InputFiles: []string{inputFile},
-            OutputFile: outputFile + "_app2",
+            ID:          "count_task",
+            Type:        OpAggregateByKey,
+            Pattern:     signPostType,
+            InputFiles:  []string{inputFile},
+            OutputFile:  outputFile + "_app2",
             ProcessedIDs: make(map[string]bool),
-            StateData: make(map[string]int64),
+            StateData:   make(map[string]int64),
         }
-        
+
         // 添加任务到leader
         leader.mutex.Lock()
         leader.Tasks[task1.ID] = task1
         leader.Tasks[task2.ID] = task2
         leader.mutex.Unlock()
 
+        // 等待一定时间，让 worker 注册完毕，然后分配任务
         go func() {
-            for {
-                leader.mutex.RLock()
-                wcount := len(leader.Workers)
-                leader.mutex.RUnlock()
-        
-                if wcount > 0 {
-                    // 有至少一个worker时就分配第一个任务
-                    leader.mutex.Lock()
-                    workers := make([]*Worker, 0, len(leader.Workers))
-                    for _, w := range leader.Workers {
-                        workers = append(workers, w)
-                    }
-        
-                    // 分配第一个任务给第一个worker
-                    if err := leader.assignTaskToWorker(task1, workers[0]); err != nil {
-                        log.Printf("Failed to assign task1: %v", err)
-                    } else {
-                        log.Printf("Task %s assigned to worker %s", task1.ID, workers[0].ID)
-                    }
-        
-                    // 若有多个worker就把第二个任务给第二个worker，否则给第一个
-                    if len(workers) > 1 {
-                        if err := leader.assignTaskToWorker(task2, workers[1]); err != nil {
-                            log.Printf("Failed to assign task2: %v", err)
-                        } else {
-                            log.Printf("Task %s assigned to worker %s", task2.ID, workers[1].ID)
-                        }
-                    } else {
-                        // 只有一个worker，给它分第二个任务
-                        if err := leader.assignTaskToWorker(task2, workers[0]); err != nil {
-                            log.Printf("Failed to assign task2: %v", err)
-                        } else {
-                            log.Printf("Task %s assigned to worker %s", task2.ID, workers[0].ID)
-                        }
-                    }
-        
-                    leader.mutex.Unlock()
-                    break 
-                }
-        
-                time.Sleep(1 * time.Second)
+            log.Println("Sleeping 5 seconds before assigning tasks...")
+            time.Sleep(5 * time.Second)
+            log.Println("Now assigning tasks...")
+
+            leader.mutex.Lock()
+            workers := make([]*Worker, 0, len(leader.Workers))
+            for _, w := range leader.Workers {
+                workers = append(workers, w)
             }
+
+            if len(workers) > 0 {
+                if err := leader.assignTaskToWorker(task1, workers[0]); err != nil {
+                    log.Printf("Failed to assign task1: %v", err)
+                }
+
+                if len(workers) > 1 {
+                    if err := leader.assignTaskToWorker(task2, workers[1]); err != nil {
+                        log.Printf("Failed to assign task2: %v", err)
+                    }
+                } else {
+                    if err := leader.assignTaskToWorker(task2, workers[0]); err != nil {
+                        log.Printf("Failed to assign task2: %v", err)
+                    }
+                }
+            } else {
+                log.Println("No workers registered yet. Tasks not assigned.")
+            }
+            leader.mutex.Unlock()
         }()
 
         log.Printf("Leader starting with %d tasks to be assigned", numTasks)
-        log.Printf("HyDFS port: %d, Leader port: %d", hydfsPort, LeaderPort)
+        log.Printf("HyDFS port: %d, Leader port: %d", n.Port, LeaderPort)
         
         if err := leader.Start(); err != nil {
             log.Fatalf("Leader failed: %v", err)
         }
-        
+
     case "worker":
-        leaderAddr := fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:%d", LeaderPort)  
-        worker := NewWorker(
-            hostname,
-            hostname,
-            WorkerBasePort + (nodeNum - 8101),  
-            hydfsNode,
-            leaderAddr,
-        )
-        
-        log.Printf("Worker starting. HyDFS port: %d, RainStorm port: %d", 
-            hydfsPort, WorkerBasePort + (nodeNum - 8101))
-        
+        // 从本地的node信息中获取host地址
+        hostname := n.ID
+        // 计算RainStorm的worker端口
+        tmpHostname := strings.TrimPrefix(hostname, "fa24-cs425-")
+        tmpHostname = strings.TrimSuffix(tmpHostname, ".cs.illinois.edu")
+        nodeNum, _ := strconv.Atoi(tmpHostname)
+        workerPort := WorkerBasePort + (nodeNum - 8101)
+
+        leaderAddr := fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:%d", LeaderPort)
+        worker := NewWorker(hostname, hostname, workerPort, n, leaderAddr)
+
+        log.Printf("Worker starting. HyDFS port: %d, RainStorm port: %d",
+            n.Port, workerPort)
+
         if err := worker.Start(); err != nil {
             log.Fatalf("Worker failed: %v", err)
         }

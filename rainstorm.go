@@ -784,9 +784,10 @@ func main() {
     }
 
     // 初始化HyDFS节点
-    hydfsNode, err := NewNode(hostname, hostname, DefaultHyDFSPort)
+    isIntroducer := role == "leader" // leader节点作为introducer
+    hydfsNode, err := initHydfs(hostname, hostname, DefaultHyDFSPort, isIntroducer)
     if err != nil {
-        log.Fatalf("Failed to create HyDFS node: %v", err)
+        log.Fatalf("Failed to initialize HyDFS: %v", err)
     }
 
     // 启动HyDFS节点

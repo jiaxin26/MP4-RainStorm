@@ -3772,9 +3772,6 @@ func handleRainStorm(n *Node, args []string) {
     numTasks, _ := strconv.Atoi(args[5])
     role := args[6]
 
-    // 我们假设在 main() 中已经调用 node.Start() 并加入或作为引导节点加入集群。
-    // 因此这里不需要再次 initHydfs，因为 n 已经是一个运行中的 HyDFS 节点。
-
     switch role {
     case "leader":
         leader := NewLeader(n)
@@ -3847,6 +3844,7 @@ func handleRainStorm(n *Node, args []string) {
         // 从本地的node信息中获取host地址
         hostname := n.ID
         // 计算RainStorm的worker端口
+        log.Printf(":::::::::%s:::::::::", hostname)
         tmpHostname := strings.TrimPrefix(hostname, "fa24-cs425-")
         log.Printf(":::::::::%s:::::::::", tmpHostname)
         tmpHostname = strings.TrimSuffix(tmpHostname, ".cs.illinois.edu")
@@ -3867,39 +3865,6 @@ func handleRainStorm(n *Node, args []string) {
     default:
         log.Fatalf("Unknown role: %s", role)
     }
-}
-
-func initHydfs(nodeID, address string, port int, isIntroducer bool) (*Node, error) {
-    // 设置日志
-    logFile := setupLogging(nodeID)
-    defer logFile.Close()
-
-    // 创建节点
-    node, err := NewNode(nodeID, address, port)
-    if err != nil {
-        return nil, fmt.Errorf("Failed to create node: %v", err)
-    }
-
-    // 设置信号处理
-    setupSignalHandler(node)
-
-    // 启动节点
-    if err := node.Start(); err != nil {
-        return nil, fmt.Errorf("Failed to start node: %v", err)
-    }
-
-    // 处理引导节点和加入集群
-    if isIntroducer {
-        if err := node.StartIntroducer(); err != nil {
-            return nil, fmt.Errorf("Failed to start introducer: %v", err)
-        }
-    } else {
-        if err := node.JoinCluster(); err != nil {
-            return nil, fmt.Errorf("Failed to join cluster: %v", err)
-        }
-    }
-
-    return node, nil
 }
 
 

@@ -131,7 +131,7 @@ func NewWorker(id, address string, port int, hydfsNode *Node, leaderAddr string)
         Port:     port,
         Tasks:    make(map[string]*Task),
         HyDFS:    hydfsNode,
-        Leader:   fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:9001"), 
+        Leader:   fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:%d", LeaderPort),
         stopChan: make(chan struct{}),
     }
 }

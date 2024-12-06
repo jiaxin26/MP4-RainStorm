@@ -595,46 +595,6 @@ func (n *Node) checkReplication() {
     }
 }
 
-// 成员管理相关方法
-// func (n *Node) handleJoin(msg Message) error {
-//     data, ok := msg.Data.(map[string]interface{})
-//     if !ok {
-//         return errors.New("invalid join message format")
-//     }
-
-//     address, ok := data["address"].(string)
-//     if !ok {
-//         return errors.New("invalid address in join message")
-//     }
-
-//     port, ok := data["port"].(float64)
-//     if !ok {
-//         return errors.New("invalid port in join message")
-//     }
-
-//     // 添加新成员
-//     n.memberMutex.Lock()
-//     n.Members[msg.SenderID] = &MemberInfo{
-//         ID:            msg.SenderID,
-//         Address:       address,
-//         Port:         int(port),
-//         Status:       StatusNormal,
-//         LastHeartbeat: time.Now(),
-//     }
-//     n.Ring.AddNode(msg.SenderID)
-//     n.memberMutex.Unlock()
-
-//     // 广播新成员加入消息
-//     joinNotification := Message{
-//         Type:      "NEW_MEMBER",
-//         SenderID:  n.ID,
-//         Timestamp: time.Now(),
-//         Data:      msg.Data,
-//     }
-//     n.broadcastMessage(joinNotification, []string{msg.SenderID})
-
-//     return nil
-// }
 
 func (n *Node) handleJoin(msg Message) error {
     data, ok := msg.Data.(map[string]interface{})
@@ -1038,87 +998,6 @@ func (n *Node) handleDeleteOperation(op Operation) error {
 
     return nil
 }
-
-// func (n *Node) handleReplication(msg Message) error {
-//     // 解析复制数据
-//     var replicationData ReplicationData
-    
-//     // 处理不同的数据格式
-//     switch data := msg.Data.(type) {
-//     case ReplicationData:
-//         replicationData = data
-//     case map[string]interface{}:
-//         // 从map构造ReplicationData
-//         filename, _ := data["filename"].(string)
-//         encodedData, _ := data["data"].(string)
-//         encodedChecksum, _ := data["checksum"].(string)
-        
-//         replicationData = ReplicationData{
-//             Filename: filename,
-//             Data:     encodedData,
-//             Checksum: encodedChecksum,
-//         }
-        
-//         // 解析FileInfo
-//         if infoData, ok := data["info"].(map[string]interface{}); ok {
-//             var info FileInfo
-//             if err := mapstructure.Decode(infoData, &info); err != nil {
-//                 return fmt.Errorf("failed to decode file info: %v", err)
-//             }
-//             replicationData.Info = info
-//         }
-//     default:
-//         return errors.New("invalid replication message format")
-//     }
-
-//     // 解码Base64数据
-//     decodedData, err := base64.StdEncoding.DecodeString(replicationData.Data)
-//     if err != nil {
-//         return fmt.Errorf("failed to decode file data: %v", err)
-//     }
-
-//     // 解码校验和
-//     expectedChecksum, err := decodeChecksum(replicationData.Checksum)
-//     if err != nil {
-//         return fmt.Errorf("failed to decode checksum: %v", err)
-//     }
-
-//     // 计算实际校验和
-//     actualChecksum := calculateChecksum(decodedData)
-
-//     n.logger.Printf("Received data size: %d, Expected checksum: %x, Actual checksum: %x",
-//         len(decodedData), expectedChecksum, actualChecksum)
-
-//     // 验证数据完整性
-//     if !bytes.Equal(actualChecksum, expectedChecksum) {
-//         return fmt.Errorf("file data integrity check failed: expected %x, got %x",
-//             expectedChecksum, actualChecksum)
-//     }
-
-//     // 存储文件信息和数据
-//     n.mutex.Lock()
-//     defer n.mutex.Unlock()
-
-//     // 创建FileInfo的副本
-//     fileInfo := replicationData.Info
-//     fileInfo.Checksum = actualChecksum // 确保使用正确的校验和
-//     n.Files[replicationData.Filename] = &fileInfo
-
-//     // 将数据分块存储
-//     n.Blocks[replicationData.Filename] = make(map[int][]byte)
-//     offset := 0
-//     for _, block := range fileInfo.Blocks {
-//         end := offset + block.Size
-//         if end > len(decodedData) {
-//             end = len(decodedData)
-//         }
-//         n.Blocks[replicationData.Filename][block.ID] = decodedData[offset:end]
-//         offset = end
-//     }
-
-//     n.logger.Printf("Successfully stored replicated file %s", replicationData.Filename)
-//     return nil
-// }
 
 func (n *Node) handleReplication(msg Message) error {
     // 解析复制数据

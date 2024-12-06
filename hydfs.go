@@ -3848,7 +3848,9 @@ func handleRainStorm(n *Node, args []string) {
         hostname := n.ID
         // 计算RainStorm的worker端口
         tmpHostname := strings.TrimPrefix(hostname, "fa24-cs425-")
+        log.Printf(":::::::::%s:::::::::", tmpHostname)
         tmpHostname = strings.TrimSuffix(tmpHostname, ".cs.illinois.edu")
+        log.Printf(":::::::::%s:::::::::", tmpHostname)
         nodeNum, _ := strconv.Atoi(tmpHostname)
         workerPort := WorkerBasePort + (nodeNum - 8101)
 

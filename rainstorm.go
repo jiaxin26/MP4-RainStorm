@@ -876,8 +876,5 @@ func main() {
     default:
         log.Fatalf("Unknown role: %s", role)
     }
-    
-    fmt.Printf("\nNode %s started successfully. Type 'help' for available commands.\n", nodeID)
-    handleCommands(node)
 
 }

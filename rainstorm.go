@@ -776,23 +776,21 @@ func main() {
     numTasks, _ := strconv.Atoi(os.Args[5])
     role := os.Args[6]
 
-    nodeNum := 1
-
     // 获取主机名作为节点ID
     hostname, err := os.Hostname()
     if err != nil {
         log.Fatalf("Failed to get hostname: %v", err)
     }
-
+    
     var hydfsPort int
+    tmpHostname := strings.TrimPrefix(hostname, "fa24-cs425-")
+    tmpHostname = strings.TrimSuffix(tmpHostname, ".cs.illinois.edu")
+    nodeNum, _ := strconv.Atoi(tmpHostname)
+    hydfsPort = HydfsBasePort + (nodeNum - 8101)  
+
     if role == "leader" {
         hydfsPort = HydfsBasePort  
-    } else {
-        tmpHostname := strings.TrimPrefix(hostname, "fa24-cs425-")
-        tmpHostname = strings.TrimSuffix(tmpHostname, ".cs.illinois.edu")
-        nodeNum, _ := strconv.Atoi(tmpHostname)
-        hydfsPort = HydfsBasePort + (nodeNum - 8101)  
-    }
+    } 
 
     // 初始化HyDFS节点
     isIntroducer := role == "leader"

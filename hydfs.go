@@ -179,13 +179,12 @@ type FileInfo struct {
     mutex        sync.RWMutex
 }
 
-// Message 网络消息
-type Message struct {
-    Type      string      `json:"type"`
-    SenderID  string      `json:"sender_id"`
-    Data      interface{} `json:"data"`
-    Timestamp time.Time   `json:"timestamp"`
-}
+// type Message struct {
+//     Type      string      `json:"type"`
+//     SenderID  string      `json:"sender_id"`
+//     Data      interface{} `json:"data"`
+//     Timestamp time.Time   `json:"timestamp"`
+// }
 
 func (m Message) String() string {
     return fmt.Sprintf("Message{Type: %s, SenderID: %s, Timestamp: %s, DataType: %T}",

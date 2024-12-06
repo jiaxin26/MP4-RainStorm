@@ -3786,7 +3786,7 @@ func handleRainStorm(n *Node, args []string) {
             Type:        OpTransform,
             Pattern:     pattern1,
             InputFiles:  []string{inputFile},
-            OutputFile:  outputFile + "_app1",
+            OutputFile:  outputFile + "_app1.txt",
             ProcessedIDs: make(map[string]bool),
         }
         
@@ -3795,7 +3795,7 @@ func handleRainStorm(n *Node, args []string) {
             Type:        OpAggregateByKey,
             Pattern:     signPostType,
             InputFiles:  []string{inputFile},
-            OutputFile:  outputFile + "_app2",
+            OutputFile:  outputFile + "_app2.txt",
             ProcessedIDs: make(map[string]bool),
             StateData:   make(map[string]int64),
         }

@@ -64,6 +64,7 @@ const (
 // Message 结构体定义
 type Message struct {
     Type      string      `json:"type"`
+    SenderID  string      `json:"sender_id"` 
     Data      interface{} `json:"data"`
     Timestamp time.Time   `json:"timestamp"`
 }

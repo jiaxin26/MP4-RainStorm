@@ -3849,7 +3849,9 @@ func handleRainStorm(n *Node, args []string) {
         workerPort := WorkerBasePort + (nodeNum - 1)
 
         leaderAddr := fmt.Sprintf("fa24-cs425-8101.cs.illinois.edu:%d", LeaderPort)
-        worker := NewWorker(hostname, hostname, workerPort, n, leaderAddr)
+        fullHostname := fmt.Sprintf("fa24-cs425-810%d.cs.illinois.edu", nodeNum)
+
+        worker := NewWorker(fullHostname, fullHostname, workerPort, n, leaderAddr)
 
         log.Printf("Worker starting. HyDFS port: %d, RainStorm port: %d",
             n.Port, workerPort)

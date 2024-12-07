@@ -3976,7 +3976,7 @@ func handleCreate(n *Node, localPath, sdfsPath string) {
     } else {
         fmt.Printf("Successfully created %s in HyDFS (took %v)\n", sdfsPath, duration)
         // 显示复制位置
-        if info, err := n.GetFileInfo(sdfsPath); err == nil {
+        if _, err := n.GetFileInfo(sdfsPath); err == nil {
             // fmt.Println("File replicated on nodes:")
             // for _, nodeID := range info.ReplicaNodes {
             //     fmt.Printf("  - %s\n", nodeID)

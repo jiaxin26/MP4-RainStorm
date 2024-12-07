@@ -25,8 +25,6 @@ import (
     "sync"
     "syscall"
     "time"
-    "github.com/mattn/go-shellwords"
-
 )
 
 const (
@@ -3880,7 +3878,7 @@ func handleCommands(n *Node) {
     scanner := bufio.NewScanner(os.Stdin)
     for scanner.Scan() {
         cmd := scanner.Text()
-        args, _ := shellwords.Parse(cmd)
+        args, _ := shlex.Split(cmd)
         if len(args) == 0 {
             continue
         }

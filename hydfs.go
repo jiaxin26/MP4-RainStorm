@@ -899,10 +899,12 @@ func (w *Worker) processCountTask(task *Task, records []Record) ([]Record, error
 
         signPost := strings.TrimSpace(fields[signPostIndex])
         category := strings.TrimSpace(fields[categoryIndex])
+        log.Printf("signPost========================================== %s", signPost)
+        log.Printf("task.Pattern========================================== %s", task.Pattern)
+
 
         // 检查signPost是否精确匹配task.Pattern
         if signPost == task.Pattern {
-            log.Printf("signPost========================================== %s", signPost)
             categoryCount[category]++
             task.ProcessedIDs[record.UniqueID] = true
         }

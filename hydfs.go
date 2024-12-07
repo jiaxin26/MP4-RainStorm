@@ -25,7 +25,6 @@ import (
     "sync"
     "syscall"
     "time"
-    "github.com/google/shlex"
 )
 
 const (

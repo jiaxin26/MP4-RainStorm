@@ -28,7 +28,7 @@ import (
 )
 
 const (
-    ReplicaCount         = 10           
+    ReplicaCount         = 3           
     VirtualNodesPerNode  = 10          
     MaxFileSize          = 100 << 20   
     BlockSize            = 4 << 20     

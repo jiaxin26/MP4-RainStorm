@@ -25,6 +25,7 @@ import (
     "sync"
     "syscall"
     "time"
+    "github.com/google/shlex"
 )
 
 const (
@@ -899,8 +900,6 @@ func (w *Worker) processCountTask(task *Task, records []Record) ([]Record, error
 
         signPost := strings.TrimSpace(fields[signPostIndex])
         category := strings.TrimSpace(fields[categoryIndex])
-        log.Printf("signPost========================================== %s", signPost)
-        log.Printf("task.Pattern========================================== %s", task.Pattern)
 
 
         // 检查signPost是否精确匹配task.Pattern
@@ -3880,7 +3879,7 @@ func handleCommands(n *Node) {
     scanner := bufio.NewScanner(os.Stdin)
     for scanner.Scan() {
         cmd := scanner.Text()
-        args := strings.Fields(cmd)
+        args, _ := shlex.Split(cmd)
         if len(args) == 0 {
             continue
         }

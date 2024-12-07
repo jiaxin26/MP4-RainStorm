@@ -27,14 +27,12 @@ import (
     "time"
 )
 
-// 系统常量
 const (
-    // 文件系统配置
-    ReplicaCount         = 3           // 副本数量
-    VirtualNodesPerNode  = 10          // 每个节点的虚拟节点数
-    MaxFileSize          = 100 << 20   // 最大文件大小: 100MB
-    BlockSize            = 4 << 20     // 块大小: 4MB
-    BasePort            = 5000         // 基础端口号
+    ReplicaCount         = 10           
+    VirtualNodesPerNode  = 10          
+    MaxFileSize          = 100 << 20   
+    BlockSize            = 4 << 20     
+    BasePort            = 5000        
     
     // 缓存配置
     MaxCacheSize        = 1 << 30     // 最大缓存大小: 1GB
@@ -3979,10 +3977,10 @@ func handleCreate(n *Node, localPath, sdfsPath string) {
         fmt.Printf("Successfully created %s in HyDFS (took %v)\n", sdfsPath, duration)
         // 显示复制位置
         if info, err := n.GetFileInfo(sdfsPath); err == nil {
-            fmt.Println("File replicated on nodes:")
-            for _, nodeID := range info.ReplicaNodes {
-                fmt.Printf("  - %s\n", nodeID)
-            }
+            // fmt.Println("File replicated on nodes:")
+            // for _, nodeID := range info.ReplicaNodes {
+            //     fmt.Printf("  - %s\n", nodeID)
+            // }
         }
     }
 }

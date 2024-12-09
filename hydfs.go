@@ -857,6 +857,7 @@ func (w *Worker) processFilterTask(task *Task, records []Record) ([]Record, erro
         if !strings.Contains(record.Value, task.Pattern) {
             continue
         }
+        // log.Printf("record.Value......%s", record.Value)
 
         fields := strings.Split(record.Value, ",")
         if len(fields) <= objectIDIndex || len(fields) <= signTypeIndex {
